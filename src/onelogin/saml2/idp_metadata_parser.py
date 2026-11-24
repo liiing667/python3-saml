@@ -225,6 +225,20 @@ class OneLogin_Saml2_IdPMetadataParser(object):
     def merge_settings(settings, new_metadata_settings):
         """
         Will update the settings with the provided new settings data extracted from the IdP metadata
+
+        The IdP certificate data extracted from the metadata is handled as a
+        complete snapshot of the certs that the IdP currently publishes:
+
+        - If the new metadata settings contain certificate material
+          (`x509cert` and/or `x509certMulti`), every previously configured
+          IdP cert (in both the single and the multi form) is discarded
+          before merging, so stale or expired certs can't survive a metadata
+          refresh, while legit cert reorderings and cert updates still apply.
+        - If the new metadata settings contain no usable certificate
+          material (e.g. a failed or incomplete refresh), the previously
+          published certs are kept untouched: a failure never overwrites
+          the last usable snapshot.
+
         :param settings: Current settings dict data
         :type settings: dict
         :param new_metadata_settings: Settings to be merged (extracted from IdP metadata after parsing)
@@ -240,12 +254,33 @@ class OneLogin_Saml2_IdPMetadataParser(object):
         # be sufficient, as it's just a shallow copy).
         result_settings = deepcopy(settings)
 
-        # previously I will take care of cert stuff
-        if "idp" in new_metadata_settings and "idp" in result_settings:
-            if new_metadata_settings["idp"].get("x509cert", None) and result_settings["idp"].get("x509certMulti", None):
-                del result_settings["idp"]["x509certMulti"]
-            if new_metadata_settings["idp"].get("x509certMulti", None) and result_settings["idp"].get("x509cert", None):
-                del result_settings["idp"]["x509cert"]
+        # Also isolate the data extracted from the IdP metadata, so the
+        # merged result does not share mutable state with it.
+        new_metadata_settings = deepcopy(new_metadata_settings)
+
+        new_idp = new_metadata_settings.get("idp", None)
+        if isinstance(new_idp, dict):
+            # A refresh that failed to extract usable certificate material
+            # must not overwrite the previously published certs. Drop empty
+            # cert placeholders from the new data so they are treated as
+            # "no cert info" instead of wiping the last usable snapshot.
+            if "x509cert" in new_idp and not new_idp["x509cert"]:
+                del new_idp["x509cert"]
+            new_x509_multi = new_idp.get("x509certMulti", None)
+            if isinstance(new_x509_multi, dict):
+                for usage in ("signing", "encryption"):
+                    if usage in new_x509_multi and not new_x509_multi[usage]:
+                        del new_x509_multi[usage]
+                if not new_x509_multi:
+                    del new_idp["x509certMulti"]
+
+            if (new_idp.get("x509cert", None) or new_idp.get("x509certMulti", None)) and isinstance(result_settings.get("idp", None), dict):
+                # The certs extracted from the IdP metadata are a complete
+                # snapshot of what the IdP currently publishes. Remove every
+                # previously configured cert (both forms) so that stale or
+                # expired certs can't survive the refresh.
+                result_settings["idp"].pop("x509cert", None)
+                result_settings["idp"].pop("x509certMulti", None)
 
         # Merge `new_metadata_settings` into `result_settings`.
         dict_deep_merge(result_settings, new_metadata_settings)

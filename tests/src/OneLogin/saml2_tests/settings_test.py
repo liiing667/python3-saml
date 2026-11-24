@@ -7,6 +7,7 @@ import unittest
 
 from onelogin.saml2 import compat
 from onelogin.saml2.errors import OneLogin_Saml2_Error
+from onelogin.saml2.idp_metadata_parser import OneLogin_Saml2_IdPMetadataParser
 from onelogin.saml2.settings import OneLogin_Saml2_Settings
 from onelogin.saml2.utils import OneLogin_Saml2_Utils
 
@@ -724,6 +725,36 @@ class OneLogin_Saml2_Settings_Test(unittest.TestCase):
         self.assertEqual("http://stuff.com/endpoints/endpoints/acs.php", sp_data["assertionConsumerService"]["url"])
         self.assertEqual("http://stuff.com/endpoints/endpoints/sls.php", sp_data["singleLogoutService"]["url"])
         self.assertEqual("urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified", sp_data["NameIDFormat"])
+
+    def testSettingsPublishesParsedCertSnapshot(self):
+        """
+        Tests that the cert snapshot parsed from refreshed IdP metadata and
+        merged into the settings is exactly the snapshot published by the
+        OneLogin_Saml2_Settings built from the merged dict.
+        """
+        settings_info = self.loadSettingsJSON()
+
+        xml_idp_metadata = self.file_contents(join(self.data_path, "metadata", "idp_metadata_multi_signing_certs.xml"))
+        parsed = OneLogin_Saml2_IdPMetadataParser.parse(xml_idp_metadata)
+        merged = OneLogin_Saml2_IdPMetadataParser.merge_settings(settings_info, parsed)
+
+        # The merged dict carries exactly the parsed cert snapshot.
+        self.assertNotIn("x509cert", merged["idp"])
+        self.assertEqual(parsed["idp"]["x509certMulti"], merged["idp"]["x509certMulti"])
+
+        settings = OneLogin_Saml2_Settings(merged)
+        idp_data = settings.get_idp_data()
+
+        # Settings publishes the same complete snapshot (certs are stored
+        # formatted, but with identical content and order).
+        parsed_signing = parsed["idp"]["x509certMulti"]["signing"]
+        published_signing = idp_data["x509certMulti"]["signing"]
+        self.assertEqual(len(parsed_signing), len(published_signing))
+        for parsed_cert, published_cert in zip(parsed_signing, published_signing):
+            self.assertEqual(OneLogin_Saml2_Utils.format_cert(parsed_cert), published_cert)
+
+        # The previous single cert is gone from the published snapshot.
+        self.assertEqual("", idp_data["x509cert"])
 
     def testGetSecurityData(self):
         """

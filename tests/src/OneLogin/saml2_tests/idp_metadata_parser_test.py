@@ -654,3 +654,146 @@ class OneLogin_Saml2_IdPMetadataParser_Test(unittest.TestCase):
         """
         expected_settings3 = json.loads(expected_settings3_json)
         self.assertEqual(expected_settings3, settings_result3)
+
+    def test_merge_settings_cert_snapshot_replaces_stale_certs(self):
+        """
+        Tests the merge_settings method of the OneLogin_Saml2_IdPMetadataParser
+        Case: The certs extracted from a metadata refresh are a complete
+              snapshot and must fully replace the previously published certs
+        """
+        settings = {
+            "idp": {
+                "entityId": "https://idp.example.com/metadata",
+                "x509certMulti": {
+                    "signing": ["OLD_SIGN_1", "OLD_SIGN_2"],
+                    "encryption": ["OLD_ENC"],
+                },
+            },
+            "security": {
+                "wantAssertionsSigned": True,
+            },
+        }
+
+        # A refresh that only publishes one signing cert must drop the stale
+        # signing certs and the leftover encryption cert from the snapshot.
+        new_metadata_settings = {
+            "idp": {
+                "x509certMulti": {
+                    "signing": ["NEW_SIGN"],
+                },
+            },
+        }
+        settings_result = OneLogin_Saml2_IdPMetadataParser.merge_settings(settings, new_metadata_settings)
+        self.assertEqual({"signing": ["NEW_SIGN"]}, settings_result["idp"]["x509certMulti"])
+        self.assertNotIn("x509cert", settings_result["idp"])
+        self.assertEqual("https://idp.example.com/metadata", settings_result["idp"]["entityId"])
+        self.assertTrue(settings_result["security"]["wantAssertionsSigned"])
+
+        # The input dictionaries must not be modified by the merge.
+        self.assertEqual(["OLD_SIGN_1", "OLD_SIGN_2"], settings["idp"]["x509certMulti"]["signing"])
+        self.assertEqual(["OLD_ENC"], settings["idp"]["x509certMulti"]["encryption"])
+        self.assertEqual({"signing": ["NEW_SIGN"]}, new_metadata_settings["idp"]["x509certMulti"])
+
+        # The merged result must not share mutable state with the new data.
+        new_metadata_settings["idp"]["x509certMulti"]["signing"].append("MUTATED")
+        self.assertEqual(["NEW_SIGN"], settings_result["idp"]["x509certMulti"]["signing"])
+
+        # Rotation from multiple certs down to a single cert: both previous
+        # cert forms must be discarded.
+        settings_result = OneLogin_Saml2_IdPMetadataParser.merge_settings(settings, {"idp": {"x509cert": "NEW_SINGLE"}})
+        self.assertEqual("NEW_SINGLE", settings_result["idp"]["x509cert"])
+        self.assertNotIn("x509certMulti", settings_result["idp"])
+
+        # Rotation from a single cert up to multiple certs.
+        single_cert_settings = {"idp": {"entityId": "https://idp.example.com/metadata", "x509cert": "OLD_SINGLE"}}
+        settings_result = OneLogin_Saml2_IdPMetadataParser.merge_settings(single_cert_settings, new_metadata_settings)
+        self.assertNotIn("x509cert", settings_result["idp"])
+        self.assertEqual(["NEW_SIGN", "MUTATED"], settings_result["idp"]["x509certMulti"]["signing"])
+
+    def test_merge_settings_cert_reorder_and_update(self):
+        """
+        Tests the merge_settings method of the OneLogin_Saml2_IdPMetadataParser
+        Case: Legit cert reorderings and cert updates keep being applied
+        """
+        settings = {
+            "idp": {
+                "entityId": "https://idp.example.com/metadata",
+                "x509certMulti": {
+                    "signing": ["CERT_A", "CERT_B"],
+                    "encryption": ["CERT_ENC"],
+                },
+            },
+        }
+
+        # Same certs, different order: the reordering is legit and must apply.
+        reordered = {
+            "idp": {
+                "x509certMulti": {
+                    "signing": ["CERT_B", "CERT_A"],
+                    "encryption": ["CERT_ENC"],
+                },
+            },
+        }
+        settings_result = OneLogin_Saml2_IdPMetadataParser.merge_settings(settings, reordered)
+        self.assertEqual(["CERT_B", "CERT_A"], settings_result["idp"]["x509certMulti"]["signing"])
+        self.assertEqual(["CERT_ENC"], settings_result["idp"]["x509certMulti"]["encryption"])
+
+        # A renewed cert replaces the old one.
+        renewed = {
+            "idp": {
+                "x509certMulti": {
+                    "signing": ["CERT_B", "CERT_C"],
+                    "encryption": ["CERT_ENC"],
+                },
+            },
+        }
+        settings_result = OneLogin_Saml2_IdPMetadataParser.merge_settings(settings, renewed)
+        self.assertEqual(["CERT_B", "CERT_C"], settings_result["idp"]["x509certMulti"]["signing"])
+
+    def test_merge_settings_failed_refresh_keeps_previous_certs(self):
+        """
+        Tests the merge_settings method of the OneLogin_Saml2_IdPMetadataParser
+        Case: A failed or incomplete refresh must not overwrite the last
+              usable cert snapshot
+        """
+        settings = {
+            "idp": {
+                "entityId": "https://idp.example.com/metadata",
+                "x509cert": "CURRENT_CERT",
+                "x509certMulti": {
+                    "signing": ["CURRENT_CERT"],
+                    "encryption": ["CURRENT_ENC"],
+                },
+            },
+        }
+
+        failed_refreshes = (
+            {},
+            {"idp": {}},
+            {"idp": {"entityId": "https://idp.example.com/metadata"}},
+            {"idp": {"x509cert": ""}},
+            {"idp": {"x509certMulti": {}}},
+            {"idp": {"x509certMulti": {"signing": []}}},
+            {"idp": {"x509cert": "", "x509certMulti": {"signing": [], "encryption": []}}},
+        )
+        for failed_refresh in failed_refreshes:
+            settings_result = OneLogin_Saml2_IdPMetadataParser.merge_settings(settings, failed_refresh)
+            self.assertEqual("CURRENT_CERT", settings_result["idp"]["x509cert"])
+            self.assertEqual({"signing": ["CURRENT_CERT"], "encryption": ["CURRENT_ENC"]}, settings_result["idp"]["x509certMulti"])
+
+        # A refresh that updates other IdP data but carries no cert material
+        # updates the rest while keeping the last usable certs.
+        partial_refresh = {
+            "idp": {
+                "entityId": "https://idp.example.com/metadata2",
+                "singleSignOnService": {
+                    "url": "https://idp.example.com/sso2",
+                    "binding": OneLogin_Saml2_Constants.BINDING_HTTP_REDIRECT,
+                },
+            },
+        }
+        settings_result = OneLogin_Saml2_IdPMetadataParser.merge_settings(settings, partial_refresh)
+        self.assertEqual("https://idp.example.com/metadata2", settings_result["idp"]["entityId"])
+        self.assertEqual("https://idp.example.com/sso2", settings_result["idp"]["singleSignOnService"]["url"])
+        self.assertEqual("CURRENT_CERT", settings_result["idp"]["x509cert"])
+        self.assertEqual({"signing": ["CURRENT_CERT"], "encryption": ["CURRENT_ENC"]}, settings_result["idp"]["x509certMulti"])
