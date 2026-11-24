@@ -8,9 +8,13 @@ MIT License
 Setting class of OneLogin's Python Toolkit.
 
 """
-from time import time
+import base64
+import hashlib
 import re
-from os.path import dirname, exists, join, sep
+from copy import deepcopy
+from time import time
+from os.path import commonpath, dirname, exists, isabs, join, realpath, sep
+from urllib.parse import urlsplit
 
 from onelogin.saml2 import compat
 from onelogin.saml2.constants import OneLogin_Saml2_Constants
@@ -108,6 +112,8 @@ class OneLogin_Saml2_Settings(object):
         self._contacts = {}
         self._organization = {}
         self._errors = []
+        self._validated_sp = {}
+        self._validated_idp = {}
 
         self._load_paths(base_path=custom_base_path)
         self._update_paths(settings)
@@ -143,6 +149,7 @@ class OneLogin_Saml2_Settings(object):
         if 'x509certNew' in self._sp:
             self.format_sp_cert_new()
         self.format_sp_key()
+        self._publish_validated_state()
 
     def _load_paths(self, base_path=None):
         """
@@ -169,6 +176,303 @@ class OneLogin_Saml2_Settings(object):
             base_path = settings['custom_base_path']
             base_path = join(dirname(__file__), base_path)
             self._load_paths(base_path)
+
+    def _resolve_cert_filename(self, filename):
+        """
+        Resolve a certificate or key filename inside the configured cert
+        directory.
+
+        Settings may only refer to files that belong to the deployment they
+        describe.  Absolute paths, NUL bytes, ``..`` traversal and symlinks
+        pointing outside of the cert directory are therefore rejected.
+
+        :param filename: Certificate or key filename from the settings
+        :type filename: string
+
+        :returns: The resolved path, or None if the filename is not safe
+        :rtype: string or None
+        """
+        if not isinstance(filename, basestring) or not filename or "\x00" in filename:
+            return None
+        if isabs(filename):
+            return None
+
+        cert_path = self.get_cert_path()
+        if not isinstance(cert_path, basestring) or not cert_path:
+            return None
+
+        try:
+            cert_dir = realpath(cert_path)
+            resolved = realpath(join(cert_dir, filename))
+            if commonpath([cert_dir, resolved]) != cert_dir:
+                return None
+        except (OSError, TypeError, ValueError):
+            return None
+        return resolved
+
+    def _read_cert_file(self, filename):
+        """
+        Read a certificate or key file after checking that it belongs to the
+        current deployment.
+
+        :returns: The file contents, or None when the file can not be used
+        :rtype: string or None
+        """
+        file_path = self._resolve_cert_filename(filename)
+        if file_path is None:
+            return None
+        try:
+            with open(file_path, 'r') as cert_file:
+                return cert_file.read()
+        except (IOError, OSError):
+            return None
+
+    @staticmethod
+    def _decode_pem_or_base64(data):
+        """
+        Decode PEM or raw base64 data into DER bytes.
+
+        The PEM header is deliberately not inspected: some deployments use
+        non-standard headers and the toolkit historically accepted the base64
+        payload as long as it was a valid certificate or key.
+        """
+        if not isinstance(data, basestring) or not data.strip():
+            return None
+
+        payload = []
+        for line in data.replace("\r", "").split("\n"):
+            line = line.strip()
+            if not line or line.startswith("-----"):
+                continue
+            payload.append(line.replace(" ", ""))
+
+        try:
+            return base64.b64decode("".join(payload), validate=False)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _get_url_host(url):
+        """
+        Return the lower-cased hostname of an absolute URL, or None when the
+        value is not an URL with a host (for example a URN entityID).
+        """
+        if not isinstance(url, basestring) or not url:
+            return None
+        try:
+            parsed = urlsplit(url)
+        except (TypeError, ValueError):
+            return None
+        if not parsed.scheme or not parsed.hostname:
+            return None
+        return parsed.hostname.lower().rstrip(".")
+
+    @classmethod
+    def _entity_matches_endpoints(cls, entity_id, endpoints):
+        """
+        Check that every absolute endpoint URL belongs to the same host as the
+        entityID that defines the deployment.
+
+        Non-URL entityIDs (URN values are common in SAML) do not carry a host,
+        so they can not be bound this way and keep their historical behavior.
+        """
+        entity_host = cls._get_url_host(entity_id)
+        if entity_host is None:
+            return True
+
+        for endpoint in endpoints:
+            if not endpoint:
+                continue
+            endpoint_host = cls._get_url_host(endpoint)
+            if endpoint_host is not None and endpoint_host != entity_host:
+                return False
+        return True
+
+    @classmethod
+    def _certificate_fingerprint(cls, certificate, algorithm):
+        """
+        Calculate a certificate fingerprint from PEM or raw base64 input.
+        """
+        if not isinstance(algorithm, basestring):
+            return None
+        der = certificate if isinstance(certificate, bytes) else cls._decode_pem_or_base64(certificate)
+        if not der:
+            return None
+        try:
+            return hashlib.new(algorithm.lower(), der).hexdigest()
+        except (ValueError, TypeError):
+            return None
+
+    @classmethod
+    def _parse_certificate(cls, data):
+        """
+        Parse a certificate.
+
+        :returns: A certificate object when cryptography is available, False
+            when the data is not a certificate, and None when parsing is not
+            available.
+        """
+        der = data if isinstance(data, bytes) else cls._decode_pem_or_base64(data)
+        if not der:
+            return False
+
+        try:
+            from cryptography import x509
+        except ImportError:
+            try:
+                import xmlsec
+                xmlsec.Key.from_memory(der, xmlsec.KeyFormat.CERT_DER, None)
+                return der
+            except Exception:
+                return False
+        try:
+            return x509.load_der_x509_certificate(der)
+        except Exception:
+            return False
+
+    @classmethod
+    def _parse_private_key(cls, data):
+        """
+        Parse an unencrypted private key.
+
+        :returns: A private key object when cryptography is available, False
+            when the data is not a private key, and None when parsing is not
+            available.
+        """
+        der = data if isinstance(data, bytes) else cls._decode_pem_or_base64(data)
+        if not der:
+            return False
+
+        try:
+            from cryptography.hazmat.primitives.serialization import load_der_private_key
+        except ImportError:
+            try:
+                import xmlsec
+                xmlsec.Key.from_memory(der, xmlsec.KeyFormat.DER, None)
+                return der
+            except Exception:
+                return False
+        try:
+            return load_der_private_key(der, password=None)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _xmlsec_private_key_matches_certificate(private_key, certificate):
+        """
+        Verify a key/certificate pair with xmlsec when cryptography is not
+        installed.  This keeps the identity check fail-closed without adding a
+        new mandatory dependency.
+        """
+        try:
+            import xmlsec
+            key_data = private_key if isinstance(private_key, bytes) else OneLogin_Saml2_Settings._decode_pem_or_base64(private_key)
+            cert_data = certificate if isinstance(certificate, bytes) else OneLogin_Saml2_Settings._decode_pem_or_base64(certificate)
+            if not key_data or not cert_data:
+                return False
+            key = xmlsec.Key.from_memory(key_data, xmlsec.KeyFormat.DER, None)
+            cert = xmlsec.Key.from_memory(cert_data, xmlsec.KeyFormat.CERT_DER, None)
+            payload = b"onelogin-saml-settings-deployment-identity"
+            for transform in (
+                xmlsec.Transform.RSA_SHA256,
+                xmlsec.Transform.RSA_SHA1,
+                xmlsec.Transform.ECDSA_SHA256,
+                xmlsec.Transform.DSA_SHA1,
+            ):
+                try:
+                    sign_context = xmlsec.SignatureContext()
+                    sign_context.key = key
+                    signature = sign_context.sign_binary(payload, transform)
+                    verify_context = xmlsec.SignatureContext()
+                    verify_context.key = cert
+                    verify_context.verify_binary(payload, transform, signature)
+                    return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False
+
+    @classmethod
+    def _certificates_match(cls, first, second):
+        """
+        Check whether two certificate representations identify the same
+        certificate.
+        """
+        first_cert = cls._parse_certificate(first)
+        second_cert = cls._parse_certificate(second)
+
+        if first_cert is not None and second_cert is not None:
+            if first_cert is False or second_cert is False:
+                return False
+            if isinstance(first_cert, bytes) and isinstance(second_cert, bytes):
+                return first_cert == second_cert
+            from cryptography.hazmat.primitives.serialization import Encoding
+            return first_cert.public_bytes(Encoding.DER) == second_cert.public_bytes(Encoding.DER)
+
+        # cryptography is unavailable.  Compare the DER payload, which is the
+        # best deployment-local check that can be made without new runtime
+        # dependencies.
+        first_der = first if isinstance(first, bytes) else cls._decode_pem_or_base64(first)
+        second_der = second if isinstance(second, bytes) else cls._decode_pem_or_base64(second)
+        return first_der is not None and first_der == second_der
+
+    @classmethod
+    def _private_key_matches_certificate(cls, private_key, certificate):
+        """
+        Check that a private key and a certificate belong to the same key pair.
+        """
+        key = cls._parse_private_key(private_key)
+        cert = cls._parse_certificate(certificate)
+        if key is None or cert is None:
+            # No parser available; do not reject otherwise valid legacy
+            # configurations because of an optional dependency.
+            return True
+        if key is False or cert is False:
+            return False
+        if isinstance(key, bytes) and isinstance(cert, bytes):
+            return cls._xmlsec_private_key_matches_certificate(private_key, certificate)
+
+        from cryptography.hazmat.primitives import serialization
+
+        key_public = key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        cert_public = cert.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        return key_public == cert_public
+
+    @classmethod
+    def _private_keys_match(cls, first, second):
+        """
+        Check whether two private key representations identify the same key.
+        """
+        first_key = cls._parse_private_key(first)
+        second_key = cls._parse_private_key(second)
+        if first_key is None or second_key is None:
+            return True
+        if first_key is False or second_key is False:
+            return False
+        if isinstance(first_key, bytes) and isinstance(second_key, bytes):
+            # xmlsec does not expose the public key derived from a private
+            # key, so the pair itself is checked against the certificate
+            # elsewhere when that is possible.
+            return True
+
+        from cryptography.hazmat.primitives import serialization
+
+        first_public = first_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        second_public = second_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        return first_public == second_public
 
     def get_base_path(self):
         """
@@ -198,18 +502,33 @@ class OneLogin_Saml2_Settings(object):
         """
         Set the filename of the SP certificate
         """
+        if self._resolve_cert_filename(filename) is None:
+            raise OneLogin_Saml2_Error(
+                'Invalid SP certificate filename',
+                OneLogin_Saml2_Error.SETTINGS_INVALID
+            )
         self._sp['cert_filename'] = filename
 
     def set_sp_key_filename(self, filename):
         """
         Set the filename of the SP key
         """
+        if self._resolve_cert_filename(filename) is None:
+            raise OneLogin_Saml2_Error(
+                'Invalid SP key filename',
+                OneLogin_Saml2_Error.SETTINGS_INVALID
+            )
         self._sp['key_filename'] = filename
 
     def set_idp_cert_filename(self, filename):
         """
         Set the filename of the idp certificate
         """
+        if self._resolve_cert_filename(filename) is None:
+            raise OneLogin_Saml2_Error(
+                'Invalid IdP certificate filename',
+                OneLogin_Saml2_Error.SETTINGS_INVALID
+            )
         self._idp['cert_filename'] = filename
 
     def get_lib_path(self):
@@ -240,6 +559,18 @@ class OneLogin_Saml2_Settings(object):
         :returns: True if the settings info is valid
         :rtype: boolean
         """
+        previous_state = {
+            'sp': deepcopy(self._sp),
+            'idp': deepcopy(self._idp),
+            'strict': self._strict,
+            'debug': self._debug,
+            'security': deepcopy(self._security),
+            'contacts': deepcopy(self._contacts),
+            'organization': deepcopy(self._organization),
+            'validated_sp': deepcopy(self._validated_sp),
+            'validated_idp': deepcopy(self._validated_idp),
+        }
+
         self._sp = settings.get('sp', {})
         self._idp = settings.get('idp', {})
         self._strict = settings.get('strict', True)
@@ -253,10 +584,32 @@ class OneLogin_Saml2_Settings(object):
         errors = self.check_settings(settings)
 
         if len(errors) == 0:
+            self._publish_validated_state()
             return True
+
+        # A failed update must not publish a partial configuration or leave a
+        # mixture of the new input and the previous deployment's state.
+        self._sp = previous_state['sp']
+        self._idp = previous_state['idp']
+        self._strict = previous_state['strict']
+        self._debug = previous_state['debug']
+        self._security = previous_state['security']
+        self._contacts = previous_state['contacts']
+        self._organization = previous_state['organization']
+        self._validated_sp = previous_state['validated_sp']
+        self._validated_idp = previous_state['validated_idp']
 
         self._errors = errors
         return False
+
+    def _publish_validated_state(self):
+        """
+        Keep an immutable snapshot of the configuration that passed
+        validation.  Consumers read this generation instead of a settings
+        dictionary that the caller may keep mutating.
+        """
+        self._validated_sp = deepcopy(self._sp)
+        self._validated_idp = deepcopy(self._idp)
 
     def _load_settings_from_file(self):
         """
@@ -397,7 +750,10 @@ class OneLogin_Saml2_Settings(object):
                 errors.append('idp_not_found')
             else:
                 allow_single_domain_urls = self._get_allow_single_label_domain(settings)
+                check_strict = bool(settings.get('strict', self._strict))
                 idp = settings['idp']
+                old_idp = self._idp
+                self._idp = idp
                 if not idp.get('entityId'):
                     errors.append('idp_entityId_not_found')
 
@@ -409,6 +765,41 @@ class OneLogin_Saml2_Settings(object):
                 slo_url = idp.get('singleLogoutService', {}).get('url')
                 if slo_url and not validate_url(slo_url, allow_single_domain_urls):
                     errors.append('idp_slo_url_invalid')
+
+                if check_strict:
+                    idp_idp_endpoints = [
+                        idp.get('singleSignOnService', {}).get('url'),
+                        slo_url,
+                        idp.get('singleLogoutService', {}).get('responseUrl'),
+                    ]
+                    if not self._entity_matches_endpoints(idp.get('entityId'), idp_idp_endpoints):
+                        errors.append('idp_entityId_endpoint_mismatch')
+
+                idp_cert_filename = idp.get('cert_filename', 'idp.crt')
+                if idp_cert_filename != 'idp.crt':
+                    idp_cert_file = self._read_cert_file(idp_cert_filename)
+                    if idp_cert_file is None:
+                        errors.append('idp_cert_not_found_and_required')
+                    else:
+                        parsed_cert = self._parse_certificate(idp_cert_file)
+                        if parsed_cert is False:
+                            errors.append('idp_cert_invalid')
+                        elif idp.get('x509cert') and not self._certificates_match(idp['x509cert'], idp_cert_file):
+                            errors.append('idp_cert_mismatch')
+
+                fingerprint_cert_is_explicit = bool(idp.get('x509cert')) or idp.get('cert_filename', 'idp.crt') != 'idp.crt'
+                if fingerprint_cert_is_explicit and 'x509certMulti' not in idp and idp.get('certFingerprint'):
+                    configured_cert = self.get_idp_cert()
+                    if configured_cert:
+                        fingerprint_alg = idp.get('certFingerprintAlgorithm', 'sha1')
+                        expected_fingerprint = re.sub(r'[\s:]', '', idp['certFingerprint']).lower()
+                        actual_fingerprint = self._certificate_fingerprint(configured_cert, fingerprint_alg)
+                        if actual_fingerprint is not None and actual_fingerprint != expected_fingerprint:
+                            errors.append('idp_cert_fingerprint_mismatch')
+
+                if check_strict and idp.get('x509cert'):
+                    if self._parse_certificate(idp['x509cert']) is False:
+                        errors.append('idp_cert_invalid')
 
                 if 'security' in settings:
                     security = settings['security']
@@ -432,6 +823,8 @@ class OneLogin_Saml2_Settings(object):
                         errors.append('idp_cert_or_fingerprint_not_found_and_required')
                     if nameid_enc and not (exists_x509 or exists_multix509enc):
                         errors.append('idp_cert_not_found_and_required')
+        if 'old_idp' in locals():
+            self._idp = old_idp
         return errors
 
     def check_sp_settings(self, settings):
@@ -452,12 +845,11 @@ class OneLogin_Saml2_Settings(object):
                 errors.append('sp_not_found')
             else:
                 allow_single_domain_urls = self._get_allow_single_label_domain(settings)
-                # check_sp_certs uses self._sp so I add it
-                old_sp = self._sp
-                self._sp = settings['sp']
-
                 sp = settings['sp']
+                old_sp = self._sp
+                self._sp = sp
                 security = settings.get('security', {})
+                check_strict = bool(settings.get('strict', self._strict))
 
                 if not sp.get('entityId'):
                     errors.append('sp_entityId_not_found')
@@ -495,6 +887,63 @@ class OneLogin_Saml2_Settings(object):
                 slo_url = sp.get('singleLogoutService', {}).get('url')
                 if slo_url and not validate_url(slo_url, allow_single_domain_urls):
                     errors.append('sp_sls_url_invalid')
+
+                if check_strict:
+                    sp_endpoints = [
+                        sp.get('assertionConsumerService', {}).get('url'),
+                        slo_url,
+                        sp.get('singleLogoutService', {}).get('responseUrl'),
+                    ]
+                    if not self._entity_matches_endpoints(sp.get('entityId'), sp_endpoints):
+                        errors.append('sp_entityId_endpoint_mismatch')
+
+                sp_cert_file = None
+                sp_key_file = None
+
+                sp_cert_filename = sp.get('cert_filename', 'sp.crt')
+                if sp_cert_filename != 'sp.crt':
+                    sp_cert_file = self._read_cert_file(sp_cert_filename)
+                    if sp_cert_file is None:
+                        errors.append('sp_cert_not_found_and_required')
+                    else:
+                        parsed_cert = self._parse_certificate(sp_cert_file)
+                        if parsed_cert is False:
+                            errors.append('sp_cert_invalid')
+                        elif sp.get('x509cert') and not self._certificates_match(sp['x509cert'], sp_cert_file):
+                            errors.append('sp_cert_mismatch')
+
+                sp_key_filename = sp.get('key_filename', 'sp.key')
+                if sp_key_filename != 'sp.key':
+                    sp_key_file = self._read_cert_file(sp_key_filename)
+                    if sp_key_file is None:
+                        errors.append('sp_cert_not_found_and_required')
+                    else:
+                        parsed_key = self._parse_private_key(sp_key_file)
+                        if parsed_key is False:
+                            errors.append('sp_private_key_invalid')
+                        elif sp.get('privateKey') and not self._private_keys_match(sp['privateKey'], sp_key_file):
+                            errors.append('sp_key_mismatch')
+
+                cert_source_explicit = bool(sp.get('x509cert')) or sp.get('cert_filename', 'sp.crt') != 'sp.crt'
+                key_source_explicit = bool(sp.get('privateKey')) or sp.get('key_filename', 'sp.key') != 'sp.key'
+                custom_filename = sp.get('cert_filename', 'sp.crt') != 'sp.crt' or \
+                    sp.get('key_filename', 'sp.key') != 'sp.key'
+                if (cert_source_explicit and key_source_explicit) or custom_filename:
+                    sp_cert = self.get_sp_cert()
+                    sp_key = self.get_sp_key()
+                    if sp_cert and sp_key and not self._private_key_matches_certificate(sp_key, sp_cert):
+                        errors.append('sp_cert_key_mismatch')
+                elif check_strict:
+                    sp_cert = self.get_sp_cert()
+                    sp_key = self.get_sp_key()
+                    if sp_cert and sp_key and not self._private_key_matches_certificate(sp_key, sp_cert):
+                        errors.append('sp_cert_key_mismatch')
+
+                if check_strict:
+                    if sp.get('x509cert') and self._parse_certificate(sp['x509cert']) is False:
+                        errors.append('sp_cert_invalid')
+                    if sp.get('privateKey') and self._parse_private_key(sp['privateKey']) is False:
+                        errors.append('sp_private_key_invalid')
 
                 if 'signMetadata' in security and isinstance(security['signMetadata'], dict):
                     if 'keyFileName' not in security['signMetadata'] or \
@@ -535,10 +984,8 @@ class OneLogin_Saml2_Settings(object):
                             ('url' not in organization or len(organization['url']) == 0):
                         errors.append('organization_not_enought_data')
                         break
-        # Restores the value that had the self._sp
         if 'old_sp' in locals():
             self._sp = old_sp
-
         return errors
 
     def check_sp_certs(self):
@@ -590,9 +1037,9 @@ class OneLogin_Saml2_Settings(object):
         :rtype: string or None
         """
         key = self._sp.get('privateKey')
-        key_file_name = self._paths['cert'] + self._sp['key_filename']
+        key_file_name = self._resolve_cert_filename(self._sp.get('key_filename', 'sp.key'))
 
-        if not key and exists(key_file_name):
+        if not key and key_file_name and exists(key_file_name):
             with open(key_file_name) as f:
                 key = f.read()
 
@@ -605,9 +1052,9 @@ class OneLogin_Saml2_Settings(object):
         :rtype: string or None
         """
         cert = self._sp.get('x509cert')
-        cert_file_name = self._paths['cert'] + self._sp['cert_filename']
+        cert_file_name = self._resolve_cert_filename(self._sp.get('cert_filename', 'sp.crt'))
 
-        if not cert and exists(cert_file_name):
+        if not cert and cert_file_name and exists(cert_file_name):
             with open(cert_file_name) as f:
                 cert = f.read()
 
@@ -621,9 +1068,9 @@ class OneLogin_Saml2_Settings(object):
         :rtype: string or None
         """
         cert = self._sp.get('x509certNew')
-        cert_file_name = self._paths['cert'] + 'sp_new.crt'
+        cert_file_name = self._resolve_cert_filename('sp_new.crt')
 
-        if not cert and exists(cert_file_name):
+        if not cert and cert_file_name and exists(cert_file_name):
             with open(cert_file_name) as f:
                 cert = f.read()
 
@@ -636,8 +1083,8 @@ class OneLogin_Saml2_Settings(object):
         :rtype: string
         """
         cert = self._idp.get('x509cert')
-        cert_file_name = self.get_cert_path() + self._idp['cert_filename']
-        if not cert and exists(cert_file_name):
+        cert_file_name = self._resolve_cert_filename(self._idp.get('cert_filename', 'idp.crt'))
+        if not cert and cert_file_name and exists(cert_file_name):
             with open(cert_file_name) as f:
                 cert = f.read()
         return cert or None
@@ -649,7 +1096,7 @@ class OneLogin_Saml2_Settings(object):
         :returns: IdP info
         :rtype: dict
         """
-        return self._idp
+        return deepcopy(self._validated_idp) if self._validated_idp else deepcopy(self._idp)
 
     def get_sp_data(self):
         """
@@ -658,7 +1105,7 @@ class OneLogin_Saml2_Settings(object):
         :returns: SP info
         :rtype: dict
         """
-        return self._sp
+        return deepcopy(self._validated_sp) if self._validated_sp else deepcopy(self._sp)
 
     def get_security_data(self):
         """
@@ -735,27 +1182,31 @@ class OneLogin_Saml2_Settings(object):
                     )
                 key_file_name = self._security['signMetadata']['keyFileName']
                 cert_file_name = self._security['signMetadata']['certFileName']
-                key_metadata_file = self._paths['cert'] + key_file_name
-                cert_metadata_file = self._paths['cert'] + cert_file_name
+                key_metadata_file = self._resolve_cert_filename(key_file_name)
+                cert_metadata_file = self._resolve_cert_filename(cert_file_name)
 
                 try:
+                    if key_metadata_file is None:
+                        raise IOError("Invalid private key filename")
                     with open(key_metadata_file, 'r') as f_metadata_key:
                         key_metadata = f_metadata_key.read()
                 except IOError:
                     raise OneLogin_Saml2_Error(
                         'Private key file not readable: %s',
                         OneLogin_Saml2_Error.PRIVATE_KEY_FILE_NOT_FOUND,
-                        key_metadata_file
+                        key_file_name
                     )
 
                 try:
+                    if cert_metadata_file is None:
+                        raise IOError("Invalid certificate filename")
                     with open(cert_metadata_file, 'r') as f_metadata_cert:
                         cert_metadata = f_metadata_cert.read()
                 except IOError:
                     raise OneLogin_Saml2_Error(
                         'Public cert file not readable: %s',
                         OneLogin_Saml2_Error.PUBLIC_CERT_FILE_NOT_FOUND,
-                        cert_metadata_file
+                        cert_file_name
                     )
 
             signature_algorithm = self._security['signatureAlgorithm']

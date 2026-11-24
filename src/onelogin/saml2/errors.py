@@ -10,7 +10,10 @@ Defines common Error codes and has a custom initializator.
 """
 
 
-class OneLogin_Saml2_Error(Exception):
+# Invalid settings and toolkit input are value errors; keeping ValueError in
+# the hierarchy lets callers reject bad deployments without catching every
+# toolkit exception.
+class OneLogin_Saml2_Error(ValueError):
     """
 
     This class implements a custom Exception handler.
