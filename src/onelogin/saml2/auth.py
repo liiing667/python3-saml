@@ -22,6 +22,9 @@ from onelogin.saml2.utils import OneLogin_Saml2_Utils, OneLogin_Saml2_Error, One
 from onelogin.saml2.xmlparser import tostring
 
 
+_REQUEST_ID_UNSET = object()
+
+
 class OneLogin_Saml2_Auth(object):
     """
 
@@ -75,6 +78,7 @@ class OneLogin_Saml2_Auth(object):
         self._last_response = None
         self._last_response_in_response_to = None
         self._last_assertion_not_on_or_after = None
+        self._processed_response_ids = set()
 
     def get_settings(self):
         """
@@ -95,41 +99,128 @@ class OneLogin_Saml2_Auth(object):
         self._settings.set_strict(value)
 
     def store_valid_response(self, response):
-        self._attributes = response.get_attributes()
-        self._friendlyname_attributes = response.get_friendlyname_attributes()
-        self._nameid = response.get_nameid()
-        self._nameid_format = response.get_nameid_format()
-        self._nameid_nq = response.get_nameid_nq()
-        self._nameid_spnq = response.get_nameid_spnq()
-        self._session_index = response.get_session_index()
-        self._session_expiration = response.get_session_not_on_or_after()
-        self._last_message_id = response.get_id()
-        self._last_assertion_id = response.get_assertion_id()
-        self._last_assertion_issue_instant = response.get_assertion_issue_instant()
-        self._last_authn_contexts = response.get_authn_contexts()
-        self._authenticated = True
-        self._last_response_in_response_to = response.get_in_response_to()
-        self._last_assertion_not_on_or_after = response.get_assertion_not_on_or_after()
+        # Build the complete successor state before publishing it.  Getters may
+        # raise (for example on duplicated attributes); in that case the old
+        # published state must not be partially replaced.
+        attributes = response.get_attributes()
+        friendlyname_attributes = response.get_friendlyname_attributes()
+        nameid = response.get_nameid()
+        nameid_format = response.get_nameid_format()
+        nameid_nq = response.get_nameid_nq()
+        nameid_spnq = response.get_nameid_spnq()
+        session_index = response.get_session_index()
+        session_expiration = response.get_session_not_on_or_after()
+        message_id = response.get_id()
+        assertion_id = response.get_assertion_id()
+        assertion_issue_instant = response.get_assertion_issue_instant()
+        authn_contexts = response.get_authn_contexts()
+        response_in_response_to = response.get_in_response_to()
+        assertion_not_on_or_after = response.get_assertion_not_on_or_after()
 
-    def process_response(self, request_id=None):
+        replay_key = assertion_id or message_id
+        if replay_key and replay_key in self._processed_response_ids:
+            raise OneLogin_Saml2_ValidationError(
+                "A repeated SAML Response/Assertion was rejected as a replay",
+                OneLogin_Saml2_ValidationError.REPLAY_DETECTED,
+            )
+
+        self._attributes = attributes
+        self._friendlyname_attributes = friendlyname_attributes
+        self._nameid = nameid
+        self._nameid_format = nameid_format
+        self._nameid_nq = nameid_nq
+        self._nameid_spnq = nameid_spnq
+        self._session_index = session_index
+        self._session_expiration = session_expiration
+        self._last_message_id = message_id
+        self._last_assertion_id = assertion_id
+        self._last_assertion_issue_instant = assertion_issue_instant
+        self._last_authn_contexts = authn_contexts
+        self._last_response_in_response_to = response_in_response_to
+        self._last_assertion_not_on_or_after = assertion_not_on_or_after
+        self._authenticated = True
+        if replay_key:
+            self._processed_response_ids.add(replay_key)
+
+    def _reset_published_response_state(self):
+        self._attributes = dict()
+        self._friendlyname_attributes = dict()
+        self._nameid = None
+        self._nameid_format = None
+        self._nameid_nq = None
+        self._nameid_spnq = None
+        self._session_index = None
+        self._session_expiration = None
+        self._authenticated = False
+        self._last_message_id = None
+        self._last_assertion_id = None
+        self._last_assertion_issue_instant = None
+        self._last_authn_contexts = []
+        self._last_response_in_response_to = None
+        self._last_assertion_not_on_or_after = None
+
+    def _extract_saml_response(self):
+        """
+        Returns the SAML Response payload from HTTP-POST or a SOAP/PAOS body.
+        The Response parser accepts both base64 form payloads and raw XML.
+        """
+        post_data = self._request_data.get("post_data")
+        if isinstance(post_data, dict) and "SAMLResponse" in post_data:
+            return post_data["SAMLResponse"]
+
+        if "SAMLResponse" in self._request_data:
+            return self._request_data["SAMLResponse"]
+
+        for key in ("soap_data", "http_body", "body"):
+            payload = self._request_data.get(key)
+            if isinstance(payload, dict) and "SAMLResponse" in payload:
+                return payload["SAMLResponse"]
+            if isinstance(payload, (str, bytes)):
+                return payload
+
+        return None
+
+    def process_response(self, request_id=_REQUEST_ID_UNSET):
         """
         Process the SAML Response sent by the IdP.
 
-        :param request_id: Is an optional argument. Is the ID of the AuthNRequest sent by this SP to the IdP.
+        :param request_id: ID of the AuthNRequest sent by this SP.  Explicitly
+            passing ``None`` requires an unsolicited response to omit all
+            InResponseTo attributes.  Omitting the argument preserves the
+            historical direct-Response compatibility behavior.
         :type request_id: string
 
         :raises: OneLogin_Saml2_Error.SAML_RESPONSE_NOT_FOUND, when a POST with a SAMLResponse is not found
         """
         self._errors = []
         self._error_reason = None
+        self._last_response = None
+        self._reset_published_response_state()
 
-        if "post_data" in self._request_data and "SAMLResponse" in self._request_data["post_data"]:
-            # AuthnResponse -- HTTP_POST Binding
-            response = self.response_class(self._settings, self._request_data["post_data"]["SAMLResponse"])
+        saml_response = self._extract_saml_response()
+        if saml_response is not None:
+            # AuthnResponse -- HTTP-POST payload or SOAP/PAOS envelope
+            response = self.response_class(self._settings, saml_response)
             self._last_response = response.get_xml_document()
 
-            if response.is_valid(self._request_data, request_id):
-                self.store_valid_response(response)
+            request_id_explicit = request_id is not _REQUEST_ID_UNSET
+            if not request_id_explicit and self._last_request_id is not None:
+                request_id = self._last_request_id
+                request_id_explicit = True
+
+            if request_id_explicit:
+                valid = response.is_valid(self._request_data, request_id)
+            else:
+                # Backwards-compatible path for callers that do not track AuthNRequest IDs.
+                valid = response.is_valid(self._request_data)
+
+            if valid:
+                try:
+                    self.store_valid_response(response)
+                except Exception as err:
+                    self._errors.append("invalid_response")
+                    self._error_reason = str(err)
+                    self._reset_published_response_state()
             else:
                 self._errors.append("invalid_response")
                 self._error_reason = response.get_error()

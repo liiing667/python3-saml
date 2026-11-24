@@ -8,9 +8,13 @@ SAML Response class of SAML Python Toolkit.
 """
 
 from copy import deepcopy
+from onelogin.saml2 import compat
 from onelogin.saml2.constants import OneLogin_Saml2_Constants
 from onelogin.saml2.utils import OneLogin_Saml2_Utils, OneLogin_Saml2_Error, OneLogin_Saml2_ValidationError, return_false_on_exception
 from onelogin.saml2.xml_utils import OneLogin_Saml2_XML
+
+
+_REQUEST_ID_UNSPECIFIED = object()
 
 
 class OneLogin_Saml2_Response(object):
@@ -28,13 +32,12 @@ class OneLogin_Saml2_Response(object):
         :param settings: The setting info
         :type settings: OneLogin_Saml2_Setting object
 
-        :param response: The base64 encoded, XML string containing the samlp:Response
+        :param response: The base64 encoded SAMLResponse, raw samlp:Response XML, or a SOAP/PAOS envelope
         :type response: string
         """
         self._settings = settings
         self._error = None
-        self.response = OneLogin_Saml2_Utils.b64decode(response)
-        self.document = OneLogin_Saml2_XML.to_etree(self.response)
+        self.response, self.document = self._parse_response_message(response)
         self.decrypted_document = None
         self.encrypted = None
         self.valid_scd_not_on_or_after = None
@@ -46,7 +49,34 @@ class OneLogin_Saml2_Response(object):
             self.encrypted = True
             self.decrypted_document = self._decrypt_assertion(decrypted_document)
 
-    def is_valid(self, request_data, request_id=None, raise_exceptions=False):
+    def _parse_response_message(self, response):
+        """
+        Accept HTTP-POST base64 messages as well as raw XML and SOAP/PAOS
+        envelopes.  The returned document is always the samlp:Response node.
+        """
+        stripped = response.lstrip() if isinstance(response, str) else response.lstrip()
+        if isinstance(stripped, str):
+            looks_like_xml = stripped.startswith("<")
+        else:
+            looks_like_xml = stripped.startswith(b"<")
+
+        if looks_like_xml:
+            xml = compat.to_bytes(response)
+        else:
+            xml = OneLogin_Saml2_Utils.b64decode(response)
+
+        document = OneLogin_Saml2_XML.to_etree(xml)
+        response_tag = "{%s}Response" % OneLogin_Saml2_Constants.NS_SAMLP
+        if document.tag != response_tag:
+            response_nodes = OneLogin_Saml2_XML.query(document, "//samlp:Response")
+            if response_nodes:
+                # Detach/root the SAML message so the toolkit's absolute SAML
+                # XPath expressions behave exactly as for HTTP-POST messages.
+                xml = OneLogin_Saml2_XML._unparse_etree(response_nodes[0])
+                document = OneLogin_Saml2_XML.to_etree(xml)
+        return xml, document
+
+    def is_valid(self, request_data, request_id=_REQUEST_ID_UNSPECIFIED, raise_exceptions=False):
         """
         Validates the response object.
 
@@ -64,6 +94,9 @@ class OneLogin_Saml2_Response(object):
         """
         self._error = None
         try:
+            request_id_explicit = request_id is not _REQUEST_ID_UNSPECIFIED
+            effective_request_id = request_id if request_id_explicit else None
+
             # Checks SAML version
             if self.document.get("Version", None) != "2.0":
                 raise OneLogin_Saml2_ValidationError("Unsupported SAML version", OneLogin_Saml2_ValidationError.UNSUPPORTED_SAML_VERSION)
@@ -88,6 +121,7 @@ class OneLogin_Saml2_Response(object):
 
             has_signed_response = "{%s}Response" % OneLogin_Saml2_Constants.NS_SAMLP in signed_elements
             has_signed_assertion = "{%s}Assertion" % OneLogin_Saml2_Constants.NS_SAML in signed_elements
+            in_response_to = self.get_in_response_to()
 
             if self._settings.is_strict():
                 no_valid_xml_msg = "Invalid SAML Response. Not match the saml-schema-protocol-2.0.xsd"
@@ -104,14 +138,12 @@ class OneLogin_Saml2_Response(object):
                 security = self._settings.get_security_data()
                 current_url = OneLogin_Saml2_Utils.get_self_url_no_query(request_data)
 
-                # Check if the InResponseTo of the Response matchs the ID of the AuthNRequest (requestId) if provided
-                in_response_to = self.get_in_response_to()
-                if in_response_to is not None and request_id is not None:
-                    if in_response_to != request_id:
-                        raise OneLogin_Saml2_ValidationError(
-                            "The InResponseTo of the Response: %s, does not match the ID of the AuthNRequest sent by the SP: %s" % (in_response_to, request_id),
-                            OneLogin_Saml2_ValidationError.WRONG_INRESPONSETO,
-                        )
+                # Check if the InResponseTo of the Response matches the ID of the AuthNRequest (requestId) if provided
+                if in_response_to is not None and effective_request_id is not None and in_response_to != effective_request_id:
+                    raise OneLogin_Saml2_ValidationError(
+                        "The InResponseTo of the Response: %s, does not match the ID of the AuthNRequest sent by the SP: %s" % (in_response_to, effective_request_id),
+                        OneLogin_Saml2_ValidationError.WRONG_INRESPONSETO,
+                    )
 
                 if not self.encrypted and security["wantAssertionsEncrypted"]:
                     raise OneLogin_Saml2_ValidationError("The assertion of the Response is not encrypted and the SP require it", OneLogin_Saml2_ValidationError.NO_ENCRYPTED_ASSERTION)
@@ -198,7 +230,8 @@ class OneLogin_Saml2_Response(object):
                         continue
                     else:
                         irt = sc_data.get("InResponseTo", None)
-                        if in_response_to and irt and irt != in_response_to:
+                        expected_in_response_to = effective_request_id if effective_request_id is not None else in_response_to
+                        if expected_in_response_to and irt and irt != expected_in_response_to:
                             continue
                         recipient = sc_data.get("Recipient", None)
                         if recipient and current_url not in recipient:
@@ -254,6 +287,11 @@ class OneLogin_Saml2_Response(object):
                 ):
                     raise OneLogin_Saml2_ValidationError("Signature validation failed. SAML Response rejected", OneLogin_Saml2_ValidationError.INVALID_SIGNATURE)
 
+            # Request correlation is an identity check, not optional schema validation.
+            # Run it after signature and primary semantic checks so existing precise
+            # validation errors remain unchanged for malformed/expired messages.
+            if request_id_explicit:
+                self.validate_request_correlation(effective_request_id, in_response_to)
             return True
         except Exception as err:
             self._error = str(err)
@@ -328,6 +366,56 @@ class OneLogin_Saml2_Response(object):
         :rtype: str
         """
         return self.document.get("InResponseTo")
+
+    def get_subject_confirmation_in_response_to(self):
+        """
+        Gets all InResponseTo values carried by SubjectConfirmationData in
+        the signed/selected assertion.
+        """
+        nodes = self._query_assertion("/saml:Subject/saml:SubjectConfirmation/saml:SubjectConfirmationData[@InResponseTo]")
+        return [node.get("InResponseTo") for node in nodes if node.get("InResponseTo")]
+
+    def validate_request_correlation(self, request_id=None, in_response_to=None):
+        """
+        Validates that both the message and assertion correlation IDs refer to
+        the AuthNRequest that initiated this login.
+
+        An unsolicited/IdP-initiated response may omit all InResponseTo
+        attributes.  A response that carries a correlation ID but does not
+        provide the original request ID cannot be safely accepted.
+        """
+        if in_response_to is None:
+            in_response_to = self.get_in_response_to()
+        assertion_in_response_to = self.get_subject_confirmation_in_response_to()
+
+        if request_id is None:
+            if in_response_to is not None or assertion_in_response_to:
+                presented = in_response_to or assertion_in_response_to[0]
+                raise OneLogin_Saml2_ValidationError(
+                    "The Response is in response to %s but no matching AuthNRequest ID was provided" % presented,
+                    OneLogin_Saml2_ValidationError.WRONG_INRESPONSETO,
+                )
+            return True
+
+        if in_response_to is not None and in_response_to != request_id:
+            raise OneLogin_Saml2_ValidationError(
+                "The InResponseTo of the Response: %s, does not match the ID of the AuthNRequest sent by the SP: %s" % (in_response_to, request_id),
+                OneLogin_Saml2_ValidationError.WRONG_INRESPONSETO,
+            )
+
+        if assertion_in_response_to and request_id not in assertion_in_response_to:
+            presented = assertion_in_response_to[0]
+            raise OneLogin_Saml2_ValidationError(
+                "The InResponseTo of the SubjectConfirmation: %s, does not match the ID of the AuthNRequest sent by the SP: %s" % (presented, request_id),
+                OneLogin_Saml2_ValidationError.WRONG_INRESPONSETO,
+            )
+
+        if in_response_to is None and not assertion_in_response_to:
+            raise OneLogin_Saml2_ValidationError(
+                "The Response does not contain an InResponseTo matching the AuthNRequest ID: %s" % request_id,
+                OneLogin_Saml2_ValidationError.WRONG_INRESPONSETO,
+            )
+        return True
 
     def get_issuers(self):
         """
