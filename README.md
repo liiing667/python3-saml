@@ -826,6 +826,36 @@ else:
     print("Error when processing SLO: %s %s" % (', '.join(errors), auth.get_last_error_reason()))
 ```
 
+The local session is only removed after the Logout message was fully validated
+(signature, issuer, status and, for Logout Responses, the request id). A
+failed validation never invokes the callback, so a pending logout state is
+preserved until a valid message arrives.
+
+When several IdPs are trusted, two of them may reuse the same NameID value. In
+order to avoid a logout from one IdP tearing down the sessions of another IdP,
+a callback that accepts one argument receives a dictionary identifying the
+subject of the validated Logout message and can remove just that session:
+
+```python
+def delete_session_callback(slo_data):
+    # slo_data contains:
+    #   'issuer'          the IdP entityID that sent the Logout message
+    #   'message_id'      the ID of the Logout Request/Logout Response
+    #   'request_id'      the SP Logout Request ID a Logout Response answers
+    #   'in_response_to'  the InResponseTo value of a Logout Response
+    #   'name_id'         the NameID value of a Logout Request (or None)
+    #   'name_id_data'    the full NameID data (Format, qualifiers, value)
+    #   'session_indexes' the SessionIndex values of a Logout Request
+    key = (slo_data['issuer'], slo_data['name_id'])
+    saml_sessions.pop(key, None)
+
+url = auth.process_slo(delete_session_cb=delete_session_callback)
+```
+
+Callbacks without any parameter keep being called with no argument and retain
+the historical behavior of flushing the whole local session, so existing
+single-IdP integrations continue to work unchanged.
+
 If the SLS endpoints receives a Logout Response, the response is validated and the session could be closed, using the callback.
 
 ```python
@@ -835,8 +865,17 @@ if not logout_response.is_valid(self.__request_data, request_id):
     self.__errors.append('invalid_logout_response')
 elif logout_response.get_status() != OneLogin_Saml2_Constants.STATUS_SUCCESS:
     self.__errors.append('logout_not_success')
-elif not keep_local_session:
-    OneLogin_Saml2_Utils.delete_local_session(delete_session_cb)
+else:
+    # Only reached when the Logout Response is valid and successful; the
+    # issuer and the request id scope the session that gets removed.
+    slo_data = {
+        'message_id': logout_response.id,
+        'request_id': request_id,
+        'in_response_to': logout_response.get_in_response_to(),
+        'issuer': logout_response.get_issuer(),
+    }
+    if not keep_local_session:
+        OneLogin_Saml2_Utils.delete_local_session(delete_session_cb, slo_data)
 ```
 
 If the SLS endpoints receives an Logout Request, the request is validated, the session is closed and a Logout Response is sent to the SLS endpoint of the IdP.
@@ -847,8 +886,16 @@ request = OneLogin_Saml2_Utils.decode_base64_and_inflate(self.__request_data['ge
 if not OneLogin_Saml2_Logout_Request.is_valid(self.__settings, request, self.__request_data):
     self.__errors.append('invalid_logout_request')
 else:
-    if not keep_local_session:
-        OneLogin_Saml2_Utils.delete_local_session(delete_session_cb)
+    # The issuer, NameID and SessionIndex identify the exact subject to log
+    # out; a request from a different IdP never touches the local session.
+    slo_data = {
+        'message_id': request.id,
+        'issuer': OneLogin_Saml2_Logout_Request.get_issuer(request),
+        'name_id': OneLogin_Saml2_Logout_Request.get_nameid(request),
+        'session_indexes': OneLogin_Saml2_Logout_Request.get_session_indexes(request),
+    }
+    if slo_data['issuer'] == self.__settings.get_idp_data()['entityId'] and not keep_local_session:
+        OneLogin_Saml2_Utils.delete_local_session(delete_session_cb, slo_data)
 
     in_response_to = request.id
     response_builder = OneLogin_Saml2_Logout_Response(self.__settings)

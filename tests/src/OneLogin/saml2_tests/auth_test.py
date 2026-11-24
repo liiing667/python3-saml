@@ -493,6 +493,196 @@ class OneLogin_Saml2_Auth_Test(unittest.TestCase):
         # $this->assertTrue(isset($_SESSION['samltest']));
         # $this->assertTrue($_SESSION['samltest']);
 
+    def _build_slo_request_data(self, filename="logout_request_deflated.xml.base64", relay_state=None):
+        request_data = self.get_request()
+        message = self.file_contents(join(self.data_path, "logout_requests", filename))
+        plain_message = compat.to_string(OneLogin_Saml2_Utils.decode_base64_and_inflate(message))
+        current_url = OneLogin_Saml2_Utils.get_self_url_no_query(request_data)
+        plain_message = plain_message.replace("http://stuff.com/endpoints/endpoints/sls.php", current_url)
+        request_data["get_data"]["SAMLRequest"] = OneLogin_Saml2_Utils.deflate_and_base64_encode(plain_message)
+        if relay_state is not None:
+            request_data["get_data"]["RelayState"] = relay_state
+        return request_data
+
+    def testProcessSLORequestScopedSessionCallback(self):
+        """
+        A valid IdP-initiated Logout Request must pass the subject data
+        (issuer, NameID, SessionIndex and message ID) to the session
+        callback so only that subject's local session is revoked.
+        """
+        request_data = self._build_slo_request_data()
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=self.loadSettingsJSON())
+        auth.set_strict(True)
+
+        removed = []
+
+        def delete_session_cb(slo_data):
+            removed.append(slo_data)
+
+        target_url = auth.process_slo(False, delete_session_cb=delete_session_cb)
+        self.assertIsNotNone(target_url)
+        self.assertEqual(len(auth.get_errors()), 0)
+        self.assertEqual(len(removed), 1)
+
+        slo_data = removed[0]
+        self.assertEqual(slo_data["issuer"], "http://idp.example.com/")
+        self.assertEqual(slo_data["name_id"], "ONELOGIN_1e442c129e1f822c8096086a1103c5ee2c7cae1c")
+        self.assertEqual(slo_data["message_id"], "ONELOGIN_21584ccdfaca36a145ae990442dcd96bfe60151e")
+        self.assertEqual(slo_data["session_indexes"], [])
+        self.assertEqual(slo_data["name_id_data"]["Format"], "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified")
+
+    def testProcessSLORequestSessionIndexPropagated(self):
+        """
+        SessionIndex values of the Logout Request are forwarded to the
+        callback so the application can revoke the exact local session.
+        """
+        plain_message = self.file_contents(join(self.data_path, "logout_requests", "logout_request_with_sessionindex.xml"))
+        request_data = self.get_request()
+        current_url = OneLogin_Saml2_Utils.get_self_url_no_query(request_data)
+        plain_message = plain_message.replace("http://stuff.com/endpoints/endpoints/sls.php", current_url)
+        request_data["get_data"]["SAMLRequest"] = OneLogin_Saml2_Utils.deflate_and_base64_encode(plain_message)
+
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=self.loadSettingsJSON())
+        auth.set_strict(True)
+
+        removed = []
+        auth.process_slo(False, delete_session_cb=lambda slo_data: removed.append(slo_data))
+
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0]["session_indexes"], ["_ac72a76526cb6ca19f8438e73879a0e6c8ae5131"])
+
+    def testProcessSLORequestWrongIssuerKeepsLocalSession(self):
+        """
+        A Logout Request coming from an issuer different from the configured
+        IdP (possible in non-strict mode) must never delete a local session,
+        while a Logout Response is still returned.
+        """
+        request_data = self.get_request()
+        plain_message = self.file_contents(join(self.data_path, "logout_requests", "invalids", "invalid_issuer.xml"))
+        current_url = OneLogin_Saml2_Utils.get_self_url_no_query(request_data)
+        plain_message = plain_message.replace("http://stuff.com/endpoints/endpoints/sls.php", current_url)
+        request_data["get_data"]["SAMLRequest"] = OneLogin_Saml2_Utils.deflate_and_base64_encode(plain_message)
+
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=self.loadSettingsJSON())
+        # Non-strict mode: is_valid accepts the wrong issuer.
+        self.assertFalse(auth.get_settings().is_strict())
+
+        removed = []
+        target_url = auth.process_slo(False, delete_session_cb=lambda slo_data: removed.append(slo_data))
+
+        # The SAML exchange still produces a redirect...
+        self.assertIsNotNone(target_url)
+        # ...but the active local session is untouched.
+        self.assertEqual(removed, [])
+
+    def testProcessSLORequestInvalidDoesNotDeletePendingSession(self):
+        """
+        When the Logout Request fails validation, the pending local session
+        state must be preserved: the callback is not invoked.
+        """
+        request_data = self.get_request()
+        message = self.file_contents(join(self.data_path, "logout_requests", "invalids", "not_after_failed.xml.base64"))
+        plain_message = compat.to_string(OneLogin_Saml2_Utils.decode_base64_and_inflate(message))
+        current_url = OneLogin_Saml2_Utils.get_self_url_no_query(request_data)
+        plain_message = plain_message.replace("http://stuff.com/endpoints/endpoints/sls.php", current_url)
+        request_data["get_data"]["SAMLRequest"] = OneLogin_Saml2_Utils.deflate_and_base64_encode(plain_message)
+
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=self.loadSettingsJSON())
+        auth.set_strict(True)
+
+        removed = []
+        target_url = auth.process_slo(False, delete_session_cb=lambda slo_data: removed.append(slo_data))
+
+        self.assertIsNone(target_url)
+        self.assertEqual(auth.get_errors(), ["invalid_logout_request"])
+        self.assertEqual(removed, [])
+
+    def testProcessSLOResponseInvalidDoesNotDeletePendingSession(self):
+        """
+        An invalid Logout Response (wrong InResponseTo request id) must not
+        remove the pending local session state.
+        """
+        request_data = self.get_request()
+        message = self.file_contents(join(self.data_path, "logout_responses", "logout_response_deflated.xml.base64"))
+        plain_message = compat.to_string(OneLogin_Saml2_Utils.decode_base64_and_inflate(message))
+        current_url = OneLogin_Saml2_Utils.get_self_url_no_query(request_data)
+        plain_message = plain_message.replace("http://stuff.com/endpoints/endpoints/sls.php", current_url)
+        request_data["get_data"]["SAMLResponse"] = OneLogin_Saml2_Utils.deflate_and_base64_encode(plain_message)
+
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=self.loadSettingsJSON())
+        auth.set_strict(True)
+
+        removed = []
+        auth.process_slo(False, request_id="wrongID", delete_session_cb=lambda slo_data: removed.append(slo_data))
+
+        self.assertEqual(auth.get_errors(), ["invalid_logout_response"])
+        self.assertEqual(removed, [])
+
+    def testProcessSLOResponseScopedSessionCallback(self):
+        """
+        A valid Logout Response forwards the issuer and the related request id
+        to the callback, scoping the session removal to that IdP/logout flow.
+        """
+        request_data = self.get_request()
+        message = self.file_contents(join(self.data_path, "logout_responses", "logout_response_deflated.xml.base64"))
+        plain_message = compat.to_string(OneLogin_Saml2_Utils.decode_base64_and_inflate(message))
+        current_url = OneLogin_Saml2_Utils.get_self_url_no_query(request_data)
+        plain_message = plain_message.replace("http://stuff.com/endpoints/endpoints/sls.php", current_url)
+        request_data["get_data"]["SAMLResponse"] = OneLogin_Saml2_Utils.deflate_and_base64_encode(plain_message)
+
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=self.loadSettingsJSON())
+        auth.set_strict(True)
+
+        removed = []
+        request_id = "ONELOGIN_21584ccdfaca36a145ae990442dcd96bfe60151e"
+        auth.process_slo(False, request_id=request_id, delete_session_cb=lambda slo_data: removed.append(slo_data))
+
+        self.assertEqual(len(auth.get_errors()), 0)
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0]["issuer"], "http://idp.example.com/")
+        self.assertEqual(removed[0]["request_id"], request_id)
+        self.assertEqual(removed[0]["in_response_to"], request_id)
+
+    def testProcessSLOBackwardCompatibleZeroArgumentCallback(self):
+        """
+        Legacy callbacks taking no argument keep working unchanged, so existing
+        single-IdP deployments that flush the whole session do not break.
+        """
+        request_data = self._build_slo_request_data()
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=self.loadSettingsJSON())
+        auth.set_strict(True)
+
+        called = []
+        target_url = auth.process_slo(False, delete_session_cb=lambda: called.append(True))
+
+        self.assertIsNotNone(target_url)
+        self.assertEqual(called, [True])
+
+    def testProcessSLORequestUndecryptableNameIDDoesNotCrash(self):
+        """
+        A Logout Request whose (encrypted) NameID cannot be resolved must not
+        make process_slo crash: the Logout Response is still produced and the
+        issuer/SessionIndex continue to scope any session removal.
+        """
+        request_data = self.get_request()
+        plain_message = self.file_contents(join(self.data_path, "logout_requests", "logout_request_encrypted_nameid.xml"))
+        current_url = OneLogin_Saml2_Utils.get_self_url_no_query(request_data)
+        plain_message = plain_message.replace("http://stuff.com/endpoints/endpoints/sls.php", current_url)
+        request_data["get_data"]["SAMLRequest"] = OneLogin_Saml2_Utils.deflate_and_base64_encode(plain_message)
+
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=self.loadSettingsJSON())
+
+        removed = []
+        target_url = None
+        try:
+            target_url = auth.process_slo(False, delete_session_cb=lambda slo_data: removed.append(slo_data))
+        except Exception as err:  # pragma: no cover - the regression is precisely that this never raises
+            self.fail("process_slo must not raise on an unresolvable NameID: %s" % err)
+
+        self.assertIsNotNone(target_url)
+        # The fixture issuer is not the configured IdP, so nothing is removed.
+        self.assertEqual(removed, [])
+
     def testProcessSLORequestRelayState(self):
         """
         Tests the process_slo method of the OneLogin_Saml2_Auth class

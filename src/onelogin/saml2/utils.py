@@ -8,6 +8,7 @@ Auxiliary class of SAML Python Toolkit.
 """
 
 import base64
+import inspect
 import warnings
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -481,13 +482,40 @@ class OneLogin_Saml2_Utils(object):
         return None
 
     @staticmethod
-    def delete_local_session(callback=None):
+    def delete_local_session(callback=None, slo_data=None):
         """
         Deletes the local session.
+
+        When the application provides a callback that accepts arguments, the
+        ``slo_data`` dict is forwarded so that only the local session(s) of the
+        subject targeted by the validated Logout message can be removed instead
+        of destroying every local session (e.g. sessions established with other
+        IdPs or sessions belonging to another NameID).
+
+        :param callback: Optional callback used to remove the local session.
+        :type callback: callable
+
+        :param slo_data: Optional data identifying the subject of the Logout
+            message (issuer, NameID data, SessionIndex and the message ID).
+        :type slo_data: dict
         """
 
         if callback is not None:
-            callback()
+            try:
+                sig = inspect.signature(callback)
+                accepts_arguments = any(
+                    parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD, parameter.VAR_POSITIONAL)
+                    for parameter in sig.parameters.values()
+                )
+            except (TypeError, ValueError):
+                # Callables without an introspectable signature (some built-ins)
+                # keep the historical no-argument behavior.
+                accepts_arguments = False
+
+            if accepts_arguments:
+                callback(slo_data or {})
+            else:
+                callback()
 
     @staticmethod
     def calculate_x509_fingerprint(x509_cert, alg="sha1"):

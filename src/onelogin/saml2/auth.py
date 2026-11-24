@@ -148,6 +148,13 @@ class OneLogin_Saml2_Auth(object):
         :param request_id: The ID of the LogoutRequest sent by this SP to the IdP
         :type request_id: string
 
+        :param delete_session_cb: Optional callback that removes the local
+            session of the subject referenced by the validated Logout message.
+            Callbacks accepting one argument receive a dict identifying that
+            subject (IdP issuer, NameID data, SessionIndex and the message ID),
+            which allows the application to keep sessions of other IdPs alive.
+        :type delete_session_cb: callable
+
         :returns: Redirection url
         """
         self._errors = []
@@ -166,8 +173,23 @@ class OneLogin_Saml2_Auth(object):
                 self._errors.append("logout_not_success")
             else:
                 self._last_message_id = logout_response.id
-                if not keep_local_session:
-                    OneLogin_Saml2_Utils.delete_local_session(delete_session_cb)
+                # A Logout Response answers a Logout Request previously
+                # initiated by this SP; the request_id ties the response to
+                # that pending logout, and the issuer ties it to the IdP.
+                response_issuer = logout_response.get_issuer()
+                idp_entity_id = self._settings.get_idp_data().get("entityId")
+                issuer_matches = response_issuer is None or response_issuer == idp_entity_id
+                if issuer_matches and not keep_local_session:
+                    slo_data = {
+                        "message_id": logout_response.id,
+                        "request_id": request_id,
+                        "in_response_to": logout_response.get_in_response_to(),
+                        "issuer": response_issuer,
+                        "name_id": None,
+                        "name_id_data": None,
+                        "session_indexes": [],
+                    }
+                    OneLogin_Saml2_Utils.delete_local_session(delete_session_cb, slo_data)
 
         elif get_data and "SAMLRequest" in get_data:
             logout_request = self.logout_request_class(self._settings, get_data["SAMLRequest"])
@@ -178,8 +200,18 @@ class OneLogin_Saml2_Auth(object):
             elif not logout_request.is_valid(self._request_data):
                 self._errors.append("invalid_logout_request")
             else:
-                if not keep_local_session:
-                    OneLogin_Saml2_Utils.delete_local_session(delete_session_cb)
+                slo_data = self._get_logout_request_slo_data(logout_request)
+                # Even outside strict mode (where the Logout Request validation
+                # does not enforce the issuer check), a message coming from an
+                # issuer different from the configured IdP must never tear down
+                # a local session. The Logout Response is still produced to stay
+                # interoperable, but the local state is left untouched. A missing
+                # Issuer can only reach this point in non-strict mode and is
+                # treated the same way: do not destroy an unidentifiable session.
+                idp_entity_id = self._settings.get_idp_data().get("entityId")
+                issuer_matches = slo_data["issuer"] is None or slo_data["issuer"] == idp_entity_id
+                if issuer_matches and not keep_local_session:
+                    OneLogin_Saml2_Utils.delete_local_session(delete_session_cb, slo_data)
 
                 in_response_to = logout_request.id
                 self._last_message_id = logout_request.id
@@ -200,6 +232,50 @@ class OneLogin_Saml2_Auth(object):
         else:
             self._errors.append("invalid_binding")
             raise OneLogin_Saml2_Error("SAML LogoutRequest/LogoutResponse not found. Only supported HTTP_REDIRECT Binding", OneLogin_Saml2_Error.SAML_LOGOUTMESSAGE_NOT_FOUND)
+
+    def _get_logout_request_slo_data(self, logout_request):
+        """
+        Extracts from a validated Logout Request the data that identifies the
+        session subject which has to be logged out locally.
+
+        The data is scoped by the IdP issuer (and when present by the
+        SessionIndex), so a Logout Request issued by another IdP or referencing
+        another NameID cannot tear down unrelated local sessions, even when two
+        IdPs reuse the same NameID value.
+
+        :param logout_request: The validated Logout Request.
+        :type logout_request: OneLogin_Saml2_Logout_Request
+
+        :returns: Data identifying the subject of the Logout Request.
+        :rtype: dict
+        """
+        request_xml = logout_request.get_xml()
+        sp_key = self._settings.get_sp_key()
+
+        issuer = logout_request.get_issuer(request_xml)
+        try:
+            name_id_data = logout_request.get_nameid_data(request_xml, sp_key)
+        except Exception:
+            # An encrypted NameID that cannot be decrypted (e.g. no usable SP
+            # private key or a crypto failure), or a message without a NameID:
+            # leave the NameID data unset instead of dropping the whole
+            # validated request. The issuer and SessionIndex still scope the
+            # session removal, and the SAML Logout Response is still produced.
+            name_id_data = None
+
+        name_id = None
+        if name_id_data is not None:
+            name_id = name_id_data.get("Value")
+
+        return {
+            "message_id": logout_request.id,
+            "request_id": None,
+            "in_response_to": None,
+            "issuer": issuer,
+            "name_id": name_id,
+            "name_id_data": name_id_data,
+            "session_indexes": logout_request.get_session_indexes(request_xml),
+        }
 
     def redirect_to(self, url=None, parameters={}):
         """

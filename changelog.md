@@ -1,4 +1,9 @@
 # python3-saml changelog
+### Unreleased
+- Scope Single Logout session removal to the subject of the validated Logout message: `process_slo` now forwards the IdP issuer, NameID data, SessionIndex and message ID to `delete_session_cb`, so a logout from one IdP no longer destroys sessions of other IdPs that reuse the same NameID value. Zero-argument callbacks keep their previous behavior.
+- A Logout Request whose issuer does not match the configured IdP (possible outside strict mode) no longer deletes a local session; the Logout Response is still returned.
+- Invalid or unsuccessful Logout messages never invoke the session deletion callback, preserving pending logout state until a valid message is received.
+
 ### 1.16.0 (Oct 9, 2023)
 - [#364](https://github.com/SAML-Toolkits/python3-saml/commit/d1bfaeb17a786735827b8252b91deafde29dabd8) Improve get_metadata method from Parser, allowing to set headers
 - Fix WantAuthnRequestsSigned parser
