@@ -1,4 +1,9 @@
 # python3-saml changelog
+### Unreleased
+- Harden HTTP-Redirect-Binding signature verification: use a single canonical ordered byte domain (`SAMLRequest`/`SAMLResponse`, `RelayState`, `SigAlg`) built from the raw, still percent-encoded query string, so parameter reordering or the case of percent-encoding can no longer change the canonical string. The `get_data`/`lowercase_urlencoding` path remains only as a fallback when no `query_string` is provided, and `validate_signature_from_qs` is now deprecated.
+- Reject Redirect-Binding messages that contain a `Signature` parameter without a `SigAlg` parameter instead of silently assuming an algorithm.
+- On signature validation failure, processing stops before the message is accepted, the local session is destroyed or any request ID / `InResponseTo` is consumed, allowing the same request ID to be retried. HTTP-POST handling and unsigned messages from legacy IdPs (when `wantMessagesSigned` is disabled) are unchanged.
+
 ### 1.16.0 (Oct 9, 2023)
 - [#364](https://github.com/SAML-Toolkits/python3-saml/commit/d1bfaeb17a786735827b8252b91deafde29dabd8) Improve get_metadata method from Parser, allowing to set headers
 - Fix WantAuthnRequestsSigned parser

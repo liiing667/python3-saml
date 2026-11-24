@@ -668,9 +668,13 @@ An explanation of some advanced request parameters:
 
 * `request_uri` - The path where your SAML server receives requests. Set this if requests are not received at the server's root.
 
-* `query_string` - Set this with additional query parameters that should be passed to the request endpoint.
+* `query_string` - The raw, still percent-encoded query string of the incoming request. When provided, Redirect-Binding (HTTP-GET) signatures are verified against this single ordered byte domain: `SAMLRequest`/`SAMLResponse`, optionally followed by `RelayState`, followed by `SigAlg`, in exactly that order. Because the exact on-the-wire bytes are used, verification no longer depends on the order in which the parameters appear in the URL nor on the case of the percent-encoding (so both standard and legacy Microsoft/ADFS IdPs work). Framework request objects url-decode `get_data` (for instance turning the `+` of a base64 value into a space), so passing `query_string` is strongly recommended.
 
-* `validate_signature_from_qs` - If `True`, use `query_string` to validate request and response signatures. Otherwise, use `get_data`. Defaults to `False`. Note that when using `get_data`, query parameters need to be url-encoded for validation. By default we use upper-case url-encoding. Some IdPs, notably Microsoft AD, use lower-case url-encoding, which makes signature validation to fail. To fix this issue, either pass `query_string` and set `validate_signature_from_qs` to `True`, which works for all IdPs, or set `lowercase_urlencoding` to `True`, which only works for AD.
+* `validate_signature_from_qs` - Deprecated. Previously this opt-in flag selected validation from `query_string`. The raw `query_string` is now used automatically whenever it is present.
+
+* `lowercase_urlencoding` - Only used by the legacy fallback that rebuilds the signed query from the already url-decoded `get_data` when no `query_string` is available. Set it to `True` for IdPs such as Microsoft AD that emit lower-case percent-encoding. Providing `query_string` works for every IdP and is preferred.
+
+Redirect-Binding messages that carry a `Signature` parameter must also carry a `SigAlg` parameter; a message with a signature but no `SigAlg` is rejected instead of being validated against an implicit default algorithm. Messages without any signature are still accepted when the SP does not require signed messages (`wantMessagesSigned` disabled), preserving compatibility with legacy IdPs. If signature validation fails, processing stops before the message (and any request ID / `InResponseTo`) is accepted or the local session is destroyed.
 
 
 #### Initiate SSO ####

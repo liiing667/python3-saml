@@ -6,6 +6,8 @@ import json
 from os.path import dirname, join, exists
 import unittest
 
+import xmlsec
+
 from onelogin.saml2 import compat
 from onelogin.saml2.auth import OneLogin_Saml2_Auth
 from onelogin.saml2.constants import OneLogin_Saml2_Constants
@@ -1119,7 +1121,9 @@ class OneLogin_Saml2_Auth_Test(unittest.TestCase):
         del request_data["get_data"]["SigAlg"]
         auth = OneLogin_Saml2_Auth(request_data, old_settings=settings)
         auth.process_slo()
-        self.assertEqual([], auth.get_errors())
+        # A Signature without SigAlg is not a valid Redirect-Binding message:
+        # the verifier must not silently fall back to a different algorithm.
+        self.assertIn("invalid_logout_response_signature", auth.get_errors())
 
         request_data["get_data"]["RelayState"] = "http://example.com/relaystate"
         auth = OneLogin_Saml2_Auth(request_data, old_settings=settings)
@@ -1242,7 +1246,9 @@ class OneLogin_Saml2_Auth_Test(unittest.TestCase):
         del request_data["get_data"]["SigAlg"]
         auth = OneLogin_Saml2_Auth(request_data, old_settings=settings)
         auth.process_slo()
-        self.assertEqual([], auth.get_errors())
+        # A Signature without SigAlg is not a valid Redirect-Binding message:
+        # the verifier must not silently fall back to a different algorithm.
+        self.assertIn("invalid_logout_request_signature", auth.get_errors())
 
         settings.set_strict(True)
         request_2 = request.replace("https://pitbulk.no-ip.org/newonelogin/demo1/index.php?sls", current_url)
@@ -1303,6 +1309,232 @@ class OneLogin_Saml2_Auth_Test(unittest.TestCase):
         auth.process_slo()
         self.assertIn("Signature validation failed. Logout Request rejected", auth.get_errors())
         self.assertEqual("Deprecated signature algorithm found: http://www.w3.org/2000/09/xmldsig#rsa-sha1", auth.get_last_error_reason())
+
+    # ---- Redirect-Binding signature canonicalization / hardening ----
+
+    REDIRECT_SAML_REQUEST = (
+        "lVLBitswEP0Vo7tjeWzJtki8LIRCYLvbNksPewmyPc6K2pJqyXQ/v1LSQlroQi/DMJr33rwZbZ2cJysezNms/"
+        "gt+X9H55G2etBOXlx1ZFy2MdMoJLWd0wvfieP/xQcCGCrsYb3ozkRvI+wjpHC5eGU2Sw35HTg3lA8hqZFwWFcM"
+        "KsStpxbEsxoLXeQN9OdY1VAgk+YqLC8gdCUQB7tyKB+281D6UaF6mtEiBPudcABcMXkiyD26Ulv6CevXeOpFlV"
+        "vlunb5ttEmV3ZjlnGn8YTRO5qx0NuBs8kzpAd829tXeucmR5NH4J/203I8el6gFRUqbFPJnyEV51Wq30by4TLW"
+        "0/9ZyarYTxt4sBsjUYLMZvRykl1Fxm90SXVkfwx4P++T4KSafVzmpUcVJ/sfSrQZJPphllv79W8WKGtLx0ir8Ir"
+        "VTqD1pT2MH3QAMSs4KTvui71jeFFiwirOmprwPkYW063+5uRq4urHiiC4e8hCX3J5wqAEGaPpw9XB5JmkBdeDqSl"
+        "kz6CmUXdl0Qae5kv2F/1384wu3PwE="
+    )
+    REDIRECT_RELAY_STATE = "_1037fbc88ec82ce8e770b2bed1119747bb812a07e6"
+
+    def _signed_redirect_request_data(self, order, lowercase_hex=False, omit_sigalg=False, tamper=False, include_query_string=True):
+        """
+        Build a signed HTTP-Redirect LogoutRequest. The signature is always
+        computed over the canonical ordered byte domain
+        (SAMLRequest, RelayState, SigAlg), while the parameters on the wire
+        may appear in any order / encoding case.
+        """
+        settings_info = self.loadSettingsJSON()
+        key = self.file_contents(join(self.data_path, "misc", "sp2.key"))
+        algorithm = OneLogin_Saml2_Constants.RSA_SHA1
+        encoded_algorithm = OneLogin_Saml2_Utils.escape_url(algorithm)
+        if lowercase_hex:
+            encoded_algorithm = encoded_algorithm.replace("%2F", "%2f").replace("%3A", "%3a")
+
+        # Sign the exact ordered byte domain that will be put on the wire.
+        canonical_query = "SAMLRequest=%s&RelayState=%s&SigAlg=%s" % (
+            self.REDIRECT_SAML_REQUEST,
+            self.REDIRECT_RELAY_STATE,
+            encoded_algorithm,
+        )
+        signature = OneLogin_Saml2_Utils.b64encode(
+            OneLogin_Saml2_Utils.sign_binary(canonical_query, key, xmlsec.Transform.RSA_SHA1)
+        )
+        if tamper:
+            signature = signature[:-4] + "AAAA"
+
+        parameters = {
+            "SAMLRequest": self.REDIRECT_SAML_REQUEST,
+            "RelayState": self.REDIRECT_RELAY_STATE,
+            "SigAlg": encoded_algorithm,
+            "Signature": signature,
+        }
+        if omit_sigalg:
+            del parameters["SigAlg"]
+
+        query_string = "&".join("%s=%s" % (name, parameters[name]) for name in order if name in parameters)
+        # get_data contains the framework-parsed (url-decoded) values, as a
+        # real integration would provide. Verification must rely on the raw
+        # query string instead of these mutated copies.
+        get_data = {key_: value[0] for key_, value in parse_qs(query_string, keep_blank_values=True).items()}
+        # parse_qs turns the "+" of base64 into spaces; restore the message
+        # parameter so the LogoutRequest can still be inflated.
+        get_data["SAMLRequest"] = self.REDIRECT_SAML_REQUEST
+
+        request_data = {"http_host": "example.com", "script_name": "index.html", "get_data": get_data}
+        if include_query_string:
+            request_data["query_string"] = query_string
+        return settings_info, request_data
+
+    def testRedirectSignatureCanonicalQueryIsOrdered(self):
+        """
+        The canonical signed query always orders the parameters as
+        SAMLRequest, RelayState, SigAlg, regardless of their order in the
+        raw query string.
+        """
+        algorithm = OneLogin_Saml2_Utils.escape_url(OneLogin_Saml2_Constants.RSA_SHA1)
+        expected = "SAMLRequest=%s&RelayState=%s&SigAlg=%s" % (
+            self.REDIRECT_SAML_REQUEST,
+            self.REDIRECT_RELAY_STATE,
+            algorithm,
+        )
+        shuffled = "Signature=abc&SigAlg=%s&RelayState=%s&SAMLRequest=%s" % (
+            algorithm,
+            self.REDIRECT_RELAY_STATE,
+            self.REDIRECT_SAML_REQUEST,
+        )
+        self.assertEqual(expected, OneLogin_Saml2_Auth._build_sign_query_from_qs(shuffled, "SAMLRequest"))
+
+    def testValidRedirectSignatureRegardlessOfParameterOrder(self):
+        """
+        Reordering the query parameters of a correctly signed Redirect
+        message must not invalidate the signature.
+        """
+        for order in (
+            ("SAMLRequest", "RelayState", "SigAlg", "Signature"),
+            ("Signature", "SigAlg", "RelayState", "SAMLRequest"),
+            ("SigAlg", "SAMLRequest", "Signature", "RelayState"),
+        ):
+            settings_info, request_data = self._signed_redirect_request_data(order)
+            auth = OneLogin_Saml2_Auth(request_data, old_settings=OneLogin_Saml2_Settings(settings_info))
+            self.assertTrue(
+                auth.validate_request_signature(request_data["get_data"]),
+                "validation failed for parameter order %s: %s" % (order, auth.get_last_error_reason()),
+            )
+
+    def testValidRedirectSignatureRegardlessOfUrlEncodingCase(self):
+        """
+        A signature computed over lower-case percent-encoding (as emitted by
+        old Microsoft/ADFS IdPs) must validate when the raw query string is
+        available, and reordering the parameters must not matter either.
+        """
+        settings_info, request_data = self._signed_redirect_request_data(
+            ("SigAlg", "SAMLRequest", "RelayState", "Signature"), lowercase_hex=True
+        )
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=OneLogin_Saml2_Settings(settings_info))
+        self.assertTrue(auth.validate_request_signature(request_data["get_data"]), auth.get_last_error_reason())
+
+    def testValidLogoutResponseSignatureRegardlessOfParameterOrder(self):
+        """
+        The same ordered-byte-domain rule applies to signed LogoutResponse
+        messages, including ones without a RelayState.
+        """
+        settings_info = self.loadSettingsJSON()
+        key = self.file_contents(join(self.data_path, "misc", "sp2.key"))
+        saml_response = (
+            "fZJva8IwEMa/Ssl7TZrW/gnqGHMMwSlM8cXeyLU9NaxNQi9lfvxVZczB5ptwSe733MPdjQma2qmFPdjOvyE5"
+            "awiDU1MbUpevCetaoyyQJmWgQVK+VOvH14WSQ6Fca70tbc1ukPsEEGHrtTUsmM8mbDfKUhnFci8gliGINI/yX"
+            "IAAiYnsw6JIRgWWAKlkwRZb6skJ64V6nKjDuSEPxvdPIowHIhpIsQkTFaYqSt9ZMEPy2oC/UEfvHSnOnfZFV"
+            "38MjR1oN7TtgRv8tAZre9CGV9jYkGtT4Wnoju6Bauprme/ebOyErZbPi9XLfLnDoohwhHGc5WVSVhjCKM6rB"
+            "MpYQpWJrIizfZ4IZNPxuTPqYrmd/m+EdONqPOfy8yG5rhxv0EMFHs52xvxWaHyd3tqD7+j37clWGGyh7vD+P"
+            "OiSrdZdWSIR49NrhR9R/teGTL8A"
+        )
+        encoded_algorithm = OneLogin_Saml2_Utils.escape_url(OneLogin_Saml2_Constants.RSA_SHA1)
+        canonical_query = "SAMLResponse=%s&SigAlg=%s" % (saml_response, encoded_algorithm)
+        signature = OneLogin_Saml2_Utils.b64encode(
+            OneLogin_Saml2_Utils.sign_binary(canonical_query, key, xmlsec.Transform.RSA_SHA1)
+        )
+        # Parameters shuffled on the wire, no RelayState.
+        query_string = "SigAlg=%s&SAMLResponse=%s&Signature=%s" % (encoded_algorithm, saml_response, signature)
+        request_data = {
+            "http_host": "example.com",
+            "script_name": "index.html",
+            "get_data": OneLogin_Saml2_Auth._parse_raw_query_parameters(query_string),
+            "query_string": query_string,
+        }
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=OneLogin_Saml2_Settings(settings_info))
+        self.assertTrue(
+            auth.validate_response_signature(request_data["get_data"]),
+            auth.get_last_error_reason(),
+        )
+
+    def testTamperedRedirectSignatureIsRejected(self):
+        """
+        Any modification of the signature bytes must fail, even though the
+        rest of the message is unchanged.
+        """
+        settings_info, request_data = self._signed_redirect_request_data(
+            ("SAMLRequest", "RelayState", "SigAlg", "Signature"), tamper=True
+        )
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=OneLogin_Saml2_Settings(settings_info))
+        self.assertFalse(auth.validate_request_signature(request_data["get_data"]))
+        self.assertEqual("Signature validation failed. SAMLRequest rejected", auth.get_last_error_reason())
+
+        # process_slo must stop here: no session teardown, no LogoutResponse
+        # built and no request ID consumed.
+        deleted_session = []
+        auth.process_slo(delete_session_cb=lambda: deleted_session.append(True))
+        self.assertIn("invalid_logout_request_signature", auth.get_errors())
+        self.assertEqual([], deleted_session)
+        self.assertIsNone(auth.get_last_response_xml())
+
+    def testSignatureWithoutSigAlgIsRejected(self):
+        """
+        A Signature parameter without SigAlg must be rejected instead of
+        silently validating against a default algorithm.
+        """
+        settings_info, request_data = self._signed_redirect_request_data(
+            ("SAMLRequest", "RelayState", "Signature"), omit_sigalg=True
+        )
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=OneLogin_Saml2_Settings(settings_info))
+        self.assertFalse(auth.validate_request_signature(request_data["get_data"]))
+        self.assertIn("no SigAlg parameter", auth.get_last_error_reason())
+
+    def testUnsignedRedirectMessageStillAcceptedWhenNotRequired(self):
+        """
+        Legacy IdPs that do not sign Redirect messages keep working when
+        wantMessagesSigned is not enabled.
+        """
+        settings_info, request_data = self._signed_redirect_request_data(
+            ("SAMLRequest", "RelayState", "SigAlg", "Signature")
+        )
+        del request_data["get_data"]["Signature"]
+        request_data["query_string"] = "SAMLRequest=%s&RelayState=%s" % (
+            self.REDIRECT_SAML_REQUEST,
+            self.REDIRECT_RELAY_STATE,
+        )
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=OneLogin_Saml2_Settings(settings_info))
+        self.assertTrue(auth.validate_request_signature(request_data["get_data"]))
+
+    def testSignatureOnlyInGetDataIsNotAcceptedAsUnsigned(self):
+        """
+        A Signature present in get_data but missing from the raw query
+        string must not be silently treated as an unsigned message.
+        """
+        settings_info, request_data = self._signed_redirect_request_data(
+            ("SAMLRequest", "RelayState", "SigAlg", "Signature")
+        )
+        request_data["query_string"] = "SAMLRequest=%s&RelayState=%s&SigAlg=%s" % (
+            self.REDIRECT_SAML_REQUEST,
+            self.REDIRECT_RELAY_STATE,
+            OneLogin_Saml2_Utils.escape_url(OneLogin_Saml2_Constants.RSA_SHA1),
+        )
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=OneLogin_Saml2_Settings(settings_info))
+        self.assertFalse(auth.validate_request_signature(request_data["get_data"]))
+        self.assertIn("not present in the raw query string", auth.get_last_error_reason())
+
+    def testFailedRedirectSignatureDoesNotConsumeRequestId(self):
+        """
+        When signature validation fails, validation must stop before any
+        InResponseTo / request ID comparison, so the caller can present the
+        same request ID again with a valid message.
+        """
+        settings_info, request_data = self._signed_redirect_request_data(
+            ("SAMLRequest", "RelayState", "SigAlg", "Signature"), tamper=True
+        )
+        request_id = "ONELOGIN_%s" % ("1" * 34)
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=OneLogin_Saml2_Settings(settings_info))
+        auth.process_slo(request_id=request_id)
+        self.assertIn("invalid_logout_request_signature", auth.get_errors())
+        # The message id is only published after the whole validation chain
+        # (including the request ID check) succeeded.
+        self.assertIsNone(auth.get_last_message_id())
 
     def testGetLastRequestID(self):
         settings_info = self.loadSettingsJSON()

@@ -11,6 +11,11 @@ Initializes the SP SAML instance
 
 import xmlsec
 
+try:
+    from urllib.parse import unquote
+except ImportError:
+    from urllib import unquote
+
 from onelogin.saml2 import compat
 from onelogin.saml2.authn_request import OneLogin_Saml2_Authn_Request
 from onelogin.saml2.constants import OneLogin_Saml2_Constants
@@ -529,18 +534,58 @@ class OneLogin_Saml2_Auth(object):
     @staticmethod
     def _build_sign_query_from_qs(query_string, saml_type):
         """
-        Build sign query from query string
+        Build the canonical signed query from the raw query string.
 
-        :param query_string: The query string
+        The signature of an HTTP-Redirect-Binding message is computed over
+        a single ordered byte domain: ``SAMLRequest``/``SAMLResponse``,
+        optionally followed by ``RelayState``, followed by ``SigAlg``, in
+        exactly that order (see SAML 2.0 Bindings, section 3.4.4.1).
+
+        The exact bytes that were put on the wire are preserved here, so the
+        result does not depend on the order in which the parameters appear in
+        the URL nor on the case of the hex digits used for percent-encoding.
+
+        :param query_string: The raw query string of the incoming request
         :type query_string: str
 
-        :param saml_type: The target URL the user should be redirected to
+        :param saml_type: The SAML message parameter to validate
         :type saml_type: string SAMLRequest | SAMLResponse
         """
-        args = ("%s=" % saml_type, "RelayState=", "SigAlg=")
-        parts = query_string.split("&")
-        # Join in the order of arguments rather than the original order of parts.
-        return "&".join(part for arg in args for part in parts if part.startswith(arg))
+        # Keep the exact on-the-wire bytes (including their percent-encoding).
+        parameters = OneLogin_Saml2_Auth._parse_raw_query_parameters(query_string)
+
+        ordered_names = [saml_type, "RelayState", "SigAlg"]
+        signed_parts = []
+        for name in ordered_names:
+            if name in parameters and parameters[name] is not None:
+                signed_parts.append("%s=%s" % (name, parameters[name]))
+        return "&".join(signed_parts)
+
+    @staticmethod
+    def _parse_raw_query_parameters(query_string):
+        """
+        Parse a raw query string without url-decoding the values.
+
+        Framework request parsers url-decode query parameters (for instance
+        turning the "+" of a base64 value into a space), which would make a
+        signature taken from ``get_data`` differ from the bytes that were
+        actually signed. This helper keeps the exact on-the-wire bytes and
+        only splits the parameters.
+
+        :param query_string: The raw query string of the incoming request
+        :type query_string: str
+
+        :returns: A dict mapping parameter names to their raw (still
+                  percent-encoded) values. Repeated names keep the first
+                  occurrence.
+        :rtype: dict
+        """
+        parameters = {}
+        for part in query_string.split("&"):
+            name, sep, value = part.partition("=")
+            if name and name not in parameters:
+                parameters[name] = value if sep else None
+        return parameters
 
     @staticmethod
     def _build_sign_query(saml_data, relay_state, algorithm, saml_type, lowercase_urlencoding=False):
@@ -640,8 +685,33 @@ class OneLogin_Saml2_Auth(object):
         :type raise_exceptions: Boolean
         """
         try:
-            signature = data.get("Signature", None)
+            query_string = self._request_data.get("query_string")
+            if query_string:
+                # Work on the raw query string: framework parsers already
+                # url-decode get_data (e.g. turning the "+" of a base64 value
+                # into a space), so values taken from get_data no longer match
+                # the signed on-the-wire bytes.
+                raw_parameters = OneLogin_Saml2_Auth._parse_raw_query_parameters(query_string)
+                signature = raw_parameters.get("Signature")
+                # SigAlg is part of the signed byte domain, so its encoded
+                # form stays untouched in the canonical query; only the value
+                # used to select the verification transform is decoded.
+                raw_sign_alg = raw_parameters.get("SigAlg")
+                sign_alg = unquote(raw_sign_alg) if raw_sign_alg is not None else None
+            else:
+                raw_parameters = None
+                signature = data.get("Signature", None)
+                sign_alg = data.get("SigAlg", None)
+
             if signature is None:
+                if raw_parameters is not None and data.get("Signature") is not None:
+                    # The framework-parsed get_data claims a Signature that is
+                    # not present in the raw query string we are verifying.
+                    # Never accept such an inconsistent message as unsigned.
+                    raise OneLogin_Saml2_ValidationError(
+                        "The Signature of the %s is not present in the raw query string. Rejected." % saml_type,
+                        OneLogin_Saml2_ValidationError.NO_SIGNED_MESSAGE,
+                    )
                 if self._settings.is_strict() and self._settings.get_security_data().get("wantMessagesSigned", False):
                     raise OneLogin_Saml2_ValidationError("The %s is not signed. Rejected." % saml_type, OneLogin_Saml2_ValidationError.NO_SIGNED_MESSAGE)
                 return True
@@ -656,7 +726,15 @@ class OneLogin_Saml2_Auth(object):
                 self._errors.append(error_msg)
                 raise OneLogin_Saml2_Error(error_msg, OneLogin_Saml2_Error.CERT_NOT_FOUND)
 
-            sign_alg = data.get("SigAlg", OneLogin_Saml2_Constants.RSA_SHA1)
+            # A Signature parameter without SigAlg is not a valid
+            # HTTP-Redirect-Binding message. Do not silently assume an
+            # algorithm: an attacker could strip SigAlg to force the
+            # verifier to validate against a different (weaker) algorithm.
+            if sign_alg is None:
+                raise OneLogin_Saml2_ValidationError(
+                    "The %s contains a Signature but no SigAlg parameter. Rejected." % saml_type,
+                    OneLogin_Saml2_ValidationError.NO_SIGNED_MESSAGE,
+                )
             if isinstance(sign_alg, bytes):
                 sign_alg = sign_alg.decode("utf8")
 
@@ -666,12 +744,27 @@ class OneLogin_Saml2_Auth(object):
                 if sign_alg in OneLogin_Saml2_Constants.DEPRECATED_ALGORITHMS:
                     raise OneLogin_Saml2_ValidationError("Deprecated signature algorithm found: %s" % sign_alg, OneLogin_Saml2_ValidationError.DEPRECATED_SIGNATURE_METHOD)
 
-            query_string = self._request_data.get("query_string")
-            if query_string and self._request_data.get("validate_signature_from_qs"):
+            # Public signature verification always uses a single ordered
+            # byte domain (SAML message, RelayState, SigAlg). When the raw
+            # query string is available it is the only source used: it
+            # preserves the exact bytes that were signed, so reordering the
+            # parameters or changing the case of the percent-encoding can no
+            # longer produce a different canonical string. The
+            # get_data/re-encoding path is only a fallback for integrations
+            # that cannot provide query_string.
+            if raw_parameters is not None:
                 signed_query = self._build_sign_query_from_qs(query_string, saml_type)
             else:
                 lowercase_urlencoding = self._request_data.get("lowercase_urlencoding", False)
                 signed_query = self._build_sign_query(data[saml_type], data.get("RelayState"), sign_alg, saml_type, lowercase_urlencoding)
+
+            # The canonical domain must contain the SAML message and the
+            # SigAlg; otherwise there is nothing meaningful to verify.
+            if not signed_query or (saml_type + "=") not in signed_query or "SigAlg=" not in signed_query:
+                raise OneLogin_Saml2_ValidationError(
+                    "Cannot build the canonical signed query for the %s. Rejected." % saml_type,
+                    OneLogin_Saml2_ValidationError.NO_SIGNED_MESSAGE,
+                )
 
             if exists_multix509sign:
                 for cert in idp_data["x509certMulti"]["signing"]:
