@@ -677,7 +677,23 @@ class OneLogin_Saml2_Response_Test(unittest.TestCase):
         response_4 = OneLogin_Saml2_Response(settings, xml_4)
         with self.assertRaises(OneLogin_Saml2_ValidationError) as duplicate_name_exc:
             response_4.get_attributes()
-        self.assertIn("Found an Attribute element with duplicated Name", str(duplicate_name_exc.exception))
+        # A single, document-order parse is shared by the Name and the
+        # FriendlyName views, so the first duplicated element in the
+        # statement (the FriendlyName here) is always the one reported, no
+        # matter which view is requested first.
+        self.assertIn("Found an Attribute element with duplicated FriendlyName", str(duplicate_name_exc.exception))
+
+        # The FriendlyName view must fail for the exact same reason: the
+        # two views cannot disagree about a duplicated statement.
+        response_4b = OneLogin_Saml2_Response(settings, xml_4)
+        with self.assertRaises(OneLogin_Saml2_ValidationError) as duplicate_friendly_exc:
+            response_4b.get_friendlyname_attributes()
+        self.assertEqual(str(duplicate_name_exc.exception), str(duplicate_friendly_exc.exception))
+
+        # A failure never leaves a half-parsed set behind: the raw source
+        # data is not cached on the rejected response.
+        self.assertIsNone(response_4._attribute_data)
+        self.assertIsNone(response_4b._attribute_data)
 
         settings = OneLogin_Saml2_Settings(self.loadSettingsJSON("settings11.json"))
         expected_attributes = {"another_value": ["value"], "duplicate_name": ["name1", "name2"], "friendly1": ["friendly1"], "friendly2": ["friendly2"], "uid": ["demo"]}
@@ -720,6 +736,120 @@ class OneLogin_Saml2_Response_Test(unittest.TestCase):
 
         response_6 = OneLogin_Saml2_Response(settings, xml_5)
         self.assertEqual(expected_attributes, response_6.get_friendlyname_attributes())
+
+    def testLegacyRepeatedAttributeNameMapping(self):
+        """
+        Tests that allowRepeatAttributeName keeps the historical mapping where
+        repeated Name/FriendlyName elements are merged in document order.
+        """
+        settings_data = OneLogin_Saml2_Settings(self.loadSettingsJSON("settings11.json"))
+
+        # Legacy mapping: repeated attribute names are still supported and the
+        # values of every element sharing a key are merged in document order.
+        xml_repeats = self.file_contents(join(self.data_path, "responses", "response1_with_duplicate_attributes.xml.base64"))
+        response_repeats = OneLogin_Saml2_Response(settings_data, xml_repeats)
+        expected_name_attributes = {
+            "another_value": ["value"],
+            "duplicate_name": ["name1", "name2"],
+            "friendly1": ["friendly1"],
+            "friendly2": ["friendly2"],
+            "uid": ["demo"],
+        }
+        self.assertEqual(expected_name_attributes, response_repeats.get_attributes())
+        expected_friendly_attributes = {"username": ["demo"], "friendlytest": ["friendly1", "friendly2"]}
+        self.assertEqual(expected_friendly_attributes, response_repeats.get_friendlyname_attributes())
+
+    def testGetAttributeDataStableSetAndSource(self):
+        """
+        Tests the get_attribute_data method preserves a stable set of
+        attributes, document order and the source (Name, FriendlyName,
+        NameFormat and position) of every value.
+        """
+        settings = OneLogin_Saml2_Settings(self.loadSettingsJSON("settings11.json"))
+        xml = self.file_contents(join(self.data_path, "responses", "response1_with_duplicate_attributes.xml.base64"))
+        response = OneLogin_Saml2_Response(settings, xml)
+
+        attribute_data = response.get_attribute_data()
+        self.assertEqual(6, len(attribute_data))
+        self.assertEqual([0, 1, 2, 3, 4, 5], [data["index"] for data in attribute_data])
+
+        # Every element keeps its own identity, even when Name or FriendlyName
+        # collide: consumers can tell where each value came from.
+        self.assertEqual("uid", attribute_data[0]["name"])
+        self.assertEqual("username", attribute_data[0]["friendlyname"])
+        self.assertEqual(["demo"], attribute_data[0]["values"])
+
+        self.assertEqual("friendly1", attribute_data[1]["name"])
+        self.assertEqual("friendlytest", attribute_data[1]["friendlyname"])
+        self.assertEqual(["friendly1"], attribute_data[1]["values"])
+
+        self.assertEqual("friendly2", attribute_data[2]["name"])
+        self.assertEqual("friendlytest", attribute_data[2]["friendlyname"])
+        self.assertEqual(["friendly2"], attribute_data[2]["values"])
+
+        self.assertEqual("duplicate_name", attribute_data[4]["name"])
+        self.assertEqual(["name1"], attribute_data[4]["values"])
+        self.assertEqual("duplicate_name", attribute_data[5]["name"])
+        self.assertEqual(["name2"], attribute_data[5]["values"])
+
+        # The Name and FriendlyName views are built from the same source data.
+        self.assertEqual(response.get_attributes(), response._build_attribute_map("Name", attribute_data))
+        self.assertEqual(response.get_friendlyname_attributes(), response._build_attribute_map("FriendlyName", attribute_data))
+
+        # The parse is done once and cached, so repeated calls return the
+        # exact same, stable representation.
+        self.assertIs(attribute_data, response.get_attribute_data())
+        self.assertEqual(response.get_attributes(), response.get_attributes())
+
+    def testGetAttributeDataMultiValued(self):
+        """
+        Tests that a legitimate multi-valued Attribute keeps every value and
+        remains available through the legacy mappings.
+        """
+        settings = OneLogin_Saml2_Settings(self.loadSettingsJSON("settings8.json"))
+        xml = self.file_contents(join(self.data_path, "responses", "signed_message_encrypted_assertion2.xml.base64"))
+        response = OneLogin_Saml2_Response(settings, xml)
+
+        attribute_data = response.get_attribute_data()
+        affiliation = [data for data in attribute_data if data["name"] == "eduPersonAffiliation"][0]
+        self.assertEqual(["user", "admin"], affiliation["values"])
+
+        # The same multi-values are exposed by the legacy Name-based mapping.
+        self.assertEqual(["user", "admin"], response.get_attributes()["eduPersonAffiliation"])
+
+    def testDuplicatedAttributesFailAtomically(self):
+        """
+        Tests that, when repeated attribute names are not allowed, the Name
+        and FriendlyName views reject the same statement for the same reason
+        without exposing a partial, order-dependent set.
+        """
+        settings = OneLogin_Saml2_Settings(self.loadSettingsJSON())
+        xml = self.file_contents(join(self.data_path, "responses", "response1_with_duplicate_attributes.xml.base64"))
+
+        response_by_name = OneLogin_Saml2_Response(settings, xml)
+        with self.assertRaises(OneLogin_Saml2_ValidationError) as name_exc:
+            response_by_name.get_attributes()
+        self.assertEqual(OneLogin_Saml2_ValidationError.DUPLICATED_ATTRIBUTE_NAME_FOUND, name_exc.exception.code)
+
+        response_by_friendly = OneLogin_Saml2_Response(settings, xml)
+        with self.assertRaises(OneLogin_Saml2_ValidationError) as friendly_exc:
+            response_by_friendly.get_friendlyname_attributes()
+        self.assertEqual(OneLogin_Saml2_ValidationError.DUPLICATED_ATTRIBUTE_NAME_FOUND, friendly_exc.exception.code)
+
+        # Both views share a single parse: the first duplicate in document
+        # order is always reported regardless of which getter is invoked.
+        self.assertEqual(str(name_exc.exception), str(friendly_exc.exception))
+
+        # Nothing is cached on failure, so a rejected response cannot leak a
+        # half-populated set of attributes.
+        self.assertIsNone(response_by_name._attribute_data)
+        self.assertIsNone(response_by_friendly._attribute_data)
+
+        # Repeated Name-only statements keep reporting the duplicated Name.
+        xml_name_only = self.file_contents(join(self.data_path, "responses", "invalids", "duplicated_attributes.xml.base64"))
+        response_name_only = OneLogin_Saml2_Response(settings, xml_name_only)
+        with self.assertRaisesRegex(OneLogin_Saml2_ValidationError, "Found an Attribute element with duplicated Name"):
+            response_name_only.get_attributes()
 
     def testGetEncryptedAttributes(self):
         """

@@ -1,4 +1,11 @@
 # python3-saml changelog
+### Unreleased
+- Parse the AttributeStatement once and cache the result, so get_attributes() and get_friendlyname_attributes() always return a stable, document-ordered set instead of disagreeing when Name/FriendlyName are repeated across Attribute elements
+- Add get_attribute_data() on OneLogin_Saml2_Response and OneLogin_Saml2_Auth, exposing every saml:Attribute element with its source (index, Name, FriendlyName, NameFormat) and values
+- Detect duplicated Name and FriendlyName on the same single pass; a rejected statement fails as a unit and never leaves a partially parsed set of attributes behind
+- Make OneLogin_Saml2_Auth.store_valid_response atomic: the authentication state is only updated after the whole response is extracted, so a failure never leaves the SP half logged-in
+- Preserve the allowRepeatAttributeName legacy mapping (repeated elements merged in document order) and legitimate multi-valued attributes
+
 ### 1.16.0 (Oct 9, 2023)
 - [#364](https://github.com/SAML-Toolkits/python3-saml/commit/d1bfaeb17a786735827b8252b91deafde29dabd8) Improve get_metadata method from Parser, allowing to set headers
 - Fix WantAuthnRequestsSigned parser

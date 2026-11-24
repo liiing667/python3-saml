@@ -38,6 +38,7 @@ class OneLogin_Saml2_Response(object):
         self.decrypted_document = None
         self.encrypted = None
         self.valid_scd_not_on_or_after = None
+        self._attribute_data = None
 
         # Quick check for the presence of EncryptedAssertion
         encrypted_assertion_nodes = self._query("/samlp:Response/saml:EncryptedAssertion")
@@ -491,6 +492,14 @@ class OneLogin_Saml2_Response(object):
         """
         Gets the Attributes from the AttributeStatement element.
         EncryptedAttributes are not supported
+
+        The attributes are parsed once (see _get_attribute_data) so the
+        returned mapping is stable: it is independent of how many times the
+        AttributeStatement is inspected and it preserves the document order
+        of the Attribute elements. When the SP does not allow repeated
+        attribute names (the default), a duplicated Name is detected on this
+        single pass and the whole parsing fails as a unit instead of
+        returning a partial, order-dependent set.
         """
         return self._get_attributes("Name")
 
@@ -498,34 +507,118 @@ class OneLogin_Saml2_Response(object):
         """
         Gets the Attributes from the AttributeStatement element indexed by FiendlyName.
         EncryptedAttributes are not supported
+
+        Built from the same single, cached parse as get_attributes, so the
+        Name and FriendlyName views always describe the same Attribute
+        elements, in the same document order.
         """
         return self._get_attributes("FriendlyName")
 
     def _get_attributes(self, attr_name):
+        return self._build_attribute_map(attr_name, self._get_attribute_data())
+
+    def get_attribute_data(self):
+        """
+        Gets the Attributes from the AttributeStatement element together with
+        their source information.
+
+        EncryptedAttributes are not supported.
+
+        Each entry keeps every value of a single saml:Attribute element and
+        records where the values came from, so consumers do not have to rely
+        on the document order of repeated Name/FriendlyName elements to know
+        which Attribute produced a given value.
+
+        :returns: A list, in document order, with one dict per saml:Attribute
+                  element containing its Name, FriendlyName, NameFormat, the
+                  position of the element in the AttributeStatement and its
+                  values.
+        :rtype: list[dict]
+        """
+        return self._get_attribute_data()
+
+    def _get_attribute_data(self):
+        """
+        Parses every saml:Attribute element of the assertion exactly once and
+        caches the result.
+
+        Duplicated Name (and FriendlyName) detection happens on this single
+        pass. When repeated attribute names are not allowed by the security
+        settings, the first duplicate raises a OneLogin_Saml2_ValidationError
+        before any (partial) mapping can be observed, so a failure never
+        leaves a half-populated set of attributes behind.
+        """
+        if self._attribute_data is not None:
+            return self._attribute_data
+
         allow_duplicates = self._settings.get_security_data().get("allowRepeatAttributeName", False)
-        attributes = {}
+        seen_names = set()
+        seen_friendly_names = set()
+        attribute_data = []
         attribute_nodes = self._query_assertion("/saml:AttributeStatement/saml:Attribute")
-        for attribute_node in attribute_nodes:
-            attr_key = attribute_node.get(attr_name)
-            if attr_key:
-                if not allow_duplicates and attr_key in attributes:
-                    raise OneLogin_Saml2_ValidationError("Found an Attribute element with duplicated " + attr_name, OneLogin_Saml2_ValidationError.DUPLICATED_ATTRIBUTE_NAME_FOUND)
+        for attribute_index, attribute_node in enumerate(attribute_nodes):
+            name = attribute_node.get("Name")
+            friendly_name = attribute_node.get("FriendlyName")
 
-                values = []
-                for attr in attribute_node.iterchildren("{%s}AttributeValue" % OneLogin_Saml2_Constants.NSMAP["saml"]):
-                    attr_text = OneLogin_Saml2_XML.element_text(attr)
+            if not allow_duplicates:
+                if name and name in seen_names:
+                    raise OneLogin_Saml2_ValidationError(
+                        "Found an Attribute element with duplicated Name",
+                        OneLogin_Saml2_ValidationError.DUPLICATED_ATTRIBUTE_NAME_FOUND,
+                    )
+                if friendly_name and friendly_name in seen_friendly_names:
+                    raise OneLogin_Saml2_ValidationError(
+                        "Found an Attribute element with duplicated FriendlyName",
+                        OneLogin_Saml2_ValidationError.DUPLICATED_ATTRIBUTE_NAME_FOUND,
+                    )
+            if name:
+                seen_names.add(name)
+            if friendly_name:
+                seen_friendly_names.add(friendly_name)
+
+            values = []
+            for attr in attribute_node.iterchildren("{%s}AttributeValue" % OneLogin_Saml2_Constants.NSMAP["saml"]):
+                attr_text = OneLogin_Saml2_XML.element_text(attr)
+                if attr_text:
+                    attr_text = attr_text.strip()
                     if attr_text:
-                        attr_text = attr_text.strip()
-                        if attr_text:
-                            values.append(attr_text)
+                        values.append(attr_text)
 
-                    # Parse any nested NameID children
-                    for nameid in attr.iterchildren("{%s}NameID" % OneLogin_Saml2_Constants.NSMAP["saml"]):
-                        values.append({"NameID": {"Format": nameid.get("Format"), "NameQualifier": nameid.get("NameQualifier"), "value": nameid.text}})
+                # Parse any nested NameID children
+                for nameid in attr.iterchildren("{%s}NameID" % OneLogin_Saml2_Constants.NSMAP["saml"]):
+                    values.append({"NameID": {"Format": nameid.get("Format"), "NameQualifier": nameid.get("NameQualifier"), "value": nameid.text}})
+
+            attribute_info = {
+                "index": attribute_index,
+                "name": name,
+                "friendlyname": friendly_name,
+                "nameformat": attribute_node.get("NameFormat"),
+                "values": values,
+            }
+            attribute_data.append(attribute_info)
+
+        # Only cache once the whole statement has been parsed successfully,
+        # so a duplicated attribute can never be observed as a partial set.
+        self._attribute_data = attribute_data
+        return attribute_data
+
+    def _build_attribute_map(self, attr_name, attribute_data):
+        """
+        Builds the legacy Name/FriendlyName -> values mapping from the single
+        parsed representation of the AttributeStatement.
+
+        Values are appended in document order. When repeated attribute names
+        are allowed, values of the several elements sharing a key are merged
+        into the same list, preserving the historical behavior.
+        """
+        attributes = {}
+        for attribute_info in attribute_data:
+            attr_key = attribute_info["name"] if attr_name == "Name" else attribute_info["friendlyname"]
+            if attr_key:
                 if attr_key in attributes:
-                    attributes[attr_key].extend(values)
+                    attributes[attr_key].extend(attribute_info["values"])
                 else:
-                    attributes[attr_key] = values
+                    attributes[attr_key] = list(attribute_info["values"])
         return attributes
 
     def validate_num_assertions(self):

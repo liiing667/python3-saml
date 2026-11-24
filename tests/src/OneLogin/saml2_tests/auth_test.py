@@ -230,6 +230,96 @@ class OneLogin_Saml2_Auth_Test(unittest.TestCase):
         self.assertIsNone(auth.get_nameid_nq())
         self.assertEqual("http://stuff.com/endpoints/metadata.php", auth.get_nameid_spnq())
 
+    def testStoreValidResponseAtomicOnFailure(self):
+        """
+        A response whose attribute parsing fails must never leave the SP
+        half logged-in: the authentication state is only updated once every
+        value has been extracted successfully.
+        """
+        from onelogin.saml2.errors import OneLogin_Saml2_ValidationError
+
+        class FailingResponse(object):
+            def get_attributes(self):
+                return {"role": ["admin"]}
+
+            def get_friendlyname_attributes(self):
+                # Simulates a duplicated FriendlyName detected after the Name
+                # view was already computed.
+                raise OneLogin_Saml2_ValidationError("Found an Attribute element with duplicated FriendlyName", OneLogin_Saml2_ValidationError.DUPLICATED_ATTRIBUTE_NAME_FOUND)
+
+            def get_attribute_data(self):
+                return []
+
+            def get_nameid(self):
+                return "nameid"
+
+            def get_nameid_format(self):
+                return None
+
+            def get_nameid_nq(self):
+                return None
+
+            def get_nameid_spnq(self):
+                return None
+
+            def get_session_index(self):
+                return None
+
+            def get_session_not_on_or_after(self):
+                return None
+
+            def get_id(self):
+                return None
+
+            def get_assertion_id(self):
+                return None
+
+            def get_assertion_issue_instant(self):
+                return None
+
+            def get_authn_contexts(self):
+                return []
+
+            def get_in_response_to(self):
+                return None
+
+            def get_assertion_not_on_or_after(self):
+                return None
+
+        auth = OneLogin_Saml2_Auth(self.get_request(), old_settings=self.loadSettingsJSON())
+        with self.assertRaises(OneLogin_Saml2_ValidationError):
+            auth.store_valid_response(FailingResponse())
+
+        # Nothing was stored: the SP is not authenticated and no partial
+        # attributes/NameID leaked from the rejected response.
+        self.assertFalse(auth.is_authenticated())
+        self.assertEqual({}, auth.get_attributes())
+        self.assertEqual({}, auth.get_friendlyname_attributes())
+        self.assertEqual([], auth.get_attribute_data())
+        self.assertIsNone(auth.get_nameid())
+
+    def testProcessResponseExposesAttributeData(self):
+        """
+        A valid processed response exposes the stable attribute set and the
+        source information through the auth object as well.
+        """
+        request_data = self.get_request()
+        message = self.file_contents(join(self.data_path, "responses", "valid_response.xml.base64"))
+        del request_data["get_data"]
+        request_data["post_data"] = {"SAMLResponse": message}
+        auth = OneLogin_Saml2_Auth(request_data, old_settings=self.loadSettingsJSON())
+        auth.process_response()
+        self.assertTrue(auth.is_authenticated())
+
+        attribute_data = auth.get_attribute_data()
+        self.assertEqual(5, len(attribute_data))
+        self.assertEqual([0, 1, 2, 3, 4], [data["index"] for data in attribute_data])
+        self.assertEqual(sorted(auth.get_attributes().keys()), sorted(data["name"] for data in attribute_data if data["name"]))
+
+        # Multi-valued attributes keep every value from their source element.
+        affiliation = [data for data in attribute_data if data["name"] == "eduPersonAffiliation"][0]
+        self.assertEqual(auth.get_attribute("eduPersonAffiliation"), affiliation["values"])
+
     def testRedirectTo(self):
         """
         Tests the redirect_to method of the OneLogin_Saml2_Auth class

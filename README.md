@@ -806,6 +806,16 @@ print(auth.get_attribute('cn'))
 
 Before trying to get an attribute, check that the user is authenticated. If the user isn't authenticated, an empty dict will be returned. For example, if we call to ``get_attributes`` before a ``auth.process_response``, the ``get_attributes()`` will return an empty dict.
 
+The AttributeStatement is parsed once and the same result is shared by ``get_attributes`` (indexed by ``Name``) and ``get_friendlyname_attributes`` (indexed by ``FriendlyName``), so both views always describe the same attributes, in document order. If the IdP repeats an attribute ``Name`` or ``FriendlyName`` on several ``Attribute`` elements, the SP rejects the response by default with a ``DUPLICATED_ATTRIBUTE_NAME_FOUND`` validation error instead of returning an order-dependent, partial set of roles. SP deployments that need to accept repeated attribute names can enable the ``allowRepeatAttributeName`` security option, in which case the values of every element sharing a key are merged in document order.
+
+When a consumer needs to know which ``Attribute`` element produced each value (for example when several elements may share a ``Name`` or ``FriendlyName``), use:
+
+```python
+attribute_data = auth.get_attribute_data()
+```
+
+This returns a list, in document order, with one dict per ``Attribute`` element containing its position in the AttributeStatement (``index``), its ``name``, ``friendlyname``, ``nameformat`` and the list of ``values``, preserving the source of every value without relying on document order to disambiguate repeated attributes.
+
 
 ***Single Logout Service (SLS)***
 
@@ -1016,6 +1026,7 @@ Main class of SAML Python Toolkit
 * ***is_authenticated*** Checks if the user is authenticated or not.
 * ***get_attributes*** Returns the set of SAML attributes.
 * ***get_attribute*** Returns the requested SAML attribute.
+* ***get_attribute_data*** Returns the SAML attributes with the source information (index, Name, FriendlyName, NameFormat and values) of every Attribute element, in document order.
 * ***get_nameid*** Returns the ``nameID``.
 * ***get_session_index*** Gets the ``SessionIndex`` from the ``AuthnStatement``.
 * ***get_session_expiration*** Gets the ``SessionNotOnOrAfter`` from the ``AuthnStatement``.

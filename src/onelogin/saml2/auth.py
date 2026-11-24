@@ -57,6 +57,7 @@ class OneLogin_Saml2_Auth(object):
             self._settings = OneLogin_Saml2_Settings(old_settings, custom_base_path)
         self._attributes = dict()
         self._friendlyname_attributes = dict()
+        self._attribute_data = []
         self._nameid = None
         self._nameid_format = None
         self._nameid_nq = None
@@ -95,21 +96,43 @@ class OneLogin_Saml2_Auth(object):
         self._settings.set_strict(value)
 
     def store_valid_response(self, response):
-        self._attributes = response.get_attributes()
-        self._friendlyname_attributes = response.get_friendlyname_attributes()
-        self._nameid = response.get_nameid()
-        self._nameid_format = response.get_nameid_format()
-        self._nameid_nq = response.get_nameid_nq()
-        self._nameid_spnq = response.get_nameid_spnq()
-        self._session_index = response.get_session_index()
-        self._session_expiration = response.get_session_not_on_or_after()
-        self._last_message_id = response.get_id()
-        self._last_assertion_id = response.get_assertion_id()
-        self._last_assertion_issue_instant = response.get_assertion_issue_instant()
-        self._last_authn_contexts = response.get_authn_contexts()
+        # Compute the whole state from the response before touching any
+        # attribute of this object. If any of the getters raises (for example
+        # a duplicated attribute name), nothing is assigned, so a failed
+        # response never leaves the SP half logged-in with a partial set of
+        # attributes or NameID data.
+        attributes = response.get_attributes()
+        friendlyname_attributes = response.get_friendlyname_attributes()
+        attribute_data = response.get_attribute_data()
+        nameid = response.get_nameid()
+        nameid_format = response.get_nameid_format()
+        nameid_nq = response.get_nameid_nq()
+        nameid_spnq = response.get_nameid_spnq()
+        session_index = response.get_session_index()
+        session_expiration = response.get_session_not_on_or_after()
+        message_id = response.get_id()
+        assertion_id = response.get_assertion_id()
+        assertion_issue_instant = response.get_assertion_issue_instant()
+        authn_contexts = response.get_authn_contexts()
+        response_in_response_to = response.get_in_response_to()
+        assertion_not_on_or_after = response.get_assertion_not_on_or_after()
+
+        self._attributes = attributes
+        self._friendlyname_attributes = friendlyname_attributes
+        self._attribute_data = attribute_data
+        self._nameid = nameid
+        self._nameid_format = nameid_format
+        self._nameid_nq = nameid_nq
+        self._nameid_spnq = nameid_spnq
+        self._session_index = session_index
+        self._session_expiration = session_expiration
+        self._last_message_id = message_id
+        self._last_assertion_id = assertion_id
+        self._last_assertion_issue_instant = assertion_issue_instant
+        self._last_authn_contexts = authn_contexts
         self._authenticated = True
-        self._last_response_in_response_to = response.get_in_response_to()
-        self._last_assertion_not_on_or_after = response.get_assertion_not_on_or_after()
+        self._last_response_in_response_to = response_in_response_to
+        self._last_assertion_not_on_or_after = assertion_not_on_or_after
 
     def process_response(self, request_id=None):
         """
@@ -242,6 +265,18 @@ class OneLogin_Saml2_Auth(object):
         :rtype: dict
         """
         return self._friendlyname_attributes
+
+    def get_attribute_data(self):
+        """
+        Returns the SAML attributes of the last processed response together
+        with the source information of every saml:Attribute element (its
+        position in the AttributeStatement, Name, FriendlyName, NameFormat
+        and values), in document order.
+
+        :returns: SAML attribute data with their sources
+        :rtype: list[dict]
+        """
+        return self._attribute_data
 
     def get_nameid(self):
         """
