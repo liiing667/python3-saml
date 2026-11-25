@@ -63,6 +63,10 @@ class OneLogin_Saml2_Response(object):
         :rtype: bool
         """
         self._error = None
+        # Reset any session data of a previous validation, it will be
+        # committed again only if every validation check passes
+        self.valid_scd_not_on_or_after = None
+        scd_not_on_or_after = None
         try:
             # Checks SAML version
             if self.document.get("Version", None) != "2.0":
@@ -178,16 +182,10 @@ class OneLogin_Saml2_Response(object):
                             OneLogin_Saml2_ValidationError.WRONG_ISSUER,
                         )
 
-                # Checks the session Expiration
-                session_expiration = self.get_session_not_on_or_after()
-                if session_expiration and session_expiration + OneLogin_Saml2_Constants.ALLOWED_CLOCK_DRIFT <= OneLogin_Saml2_Utils.now():
-                    raise OneLogin_Saml2_ValidationError(
-                        "The attributes have expired, based on the SessionNotOnOrAfter of the AttributeStatement of this Response", OneLogin_Saml2_ValidationError.SESSION_EXPIRED
-                    )
-
                 # Checks the SubjectConfirmation, at least one SubjectConfirmation must be valid
                 any_subject_confirmation = False
                 subject_confirmation_nodes = self._query_assertion("/saml:Subject/saml:SubjectConfirmation")
+                now = OneLogin_Saml2_Utils.now()
 
                 for scn in subject_confirmation_nodes:
                     method = scn.get("Method", None)
@@ -206,16 +204,16 @@ class OneLogin_Saml2_Response(object):
                         nooa = sc_data.get("NotOnOrAfter", None)
                         if nooa:
                             parsed_nooa = OneLogin_Saml2_Utils.parse_SAML_to_time(nooa)
-                            if parsed_nooa + OneLogin_Saml2_Constants.ALLOWED_CLOCK_DRIFT <= OneLogin_Saml2_Utils.now():
+                            if parsed_nooa + OneLogin_Saml2_Constants.ALLOWED_CLOCK_DRIFT <= now:
                                 continue
                         nb = sc_data.get("NotBefore", None)
                         if nb:
                             parsed_nb = OneLogin_Saml2_Utils.parse_SAML_to_time(nb)
-                            if parsed_nb > OneLogin_Saml2_Utils.now() + OneLogin_Saml2_Constants.ALLOWED_CLOCK_DRIFT:
+                            if parsed_nb > now + OneLogin_Saml2_Constants.ALLOWED_CLOCK_DRIFT:
                                 continue
 
                         if nooa:
-                            self.valid_scd_not_on_or_after = OneLogin_Saml2_Utils.parse_SAML_to_time(nooa)
+                            scd_not_on_or_after = OneLogin_Saml2_Utils.parse_SAML_to_time(nooa)
 
                         any_subject_confirmation = True
                         break
@@ -254,6 +252,8 @@ class OneLogin_Saml2_Response(object):
                 ):
                     raise OneLogin_Saml2_ValidationError("Signature validation failed. SAML Response rejected", OneLogin_Saml2_ValidationError.INVALID_SIGNATURE)
 
+            # Every validation check passed, commit the session data of the valid response
+            self.valid_scd_not_on_or_after = scd_not_on_or_after
             return True
         except Exception as err:
             self._error = str(err)
@@ -655,19 +655,33 @@ class OneLogin_Saml2_Response(object):
     def validate_timestamps(self):
         """
         Verifies that the document is valid according to Conditions Element
+        and the SessionNotOnOrAfter value of the AuthnStatement.
+
+        All the timestamps are validated against a unique reference time,
+        applying the allowed clock drift on every boundary.
 
         :returns: True if the condition is valid, False otherwise
         :rtype: bool
         """
+        now = OneLogin_Saml2_Utils.now()
+
         conditions_nodes = self._query_assertion("/saml:Conditions")
 
         for conditions_node in conditions_nodes:
             nb_attr = conditions_node.get("NotBefore")
             nooa_attr = conditions_node.get("NotOnOrAfter")
-            if nb_attr and OneLogin_Saml2_Utils.parse_SAML_to_time(nb_attr) > OneLogin_Saml2_Utils.now() + OneLogin_Saml2_Constants.ALLOWED_CLOCK_DRIFT:
-                raise OneLogin_Saml2_ValidationError("Could not validate timestamp: not yet valid. Check system clock.", OneLogin_Saml2_ValidationError.ASSERTION_TOO_EARLY)
-            if nooa_attr and OneLogin_Saml2_Utils.parse_SAML_to_time(nooa_attr) + OneLogin_Saml2_Constants.ALLOWED_CLOCK_DRIFT <= OneLogin_Saml2_Utils.now():
-                raise OneLogin_Saml2_ValidationError("Could not validate timestamp: expired. Check system clock.", OneLogin_Saml2_ValidationError.ASSERTION_EXPIRED)
+            if nb_attr and OneLogin_Saml2_Utils.parse_SAML_to_time(nb_attr) > now + OneLogin_Saml2_Constants.ALLOWED_CLOCK_DRIFT:
+                self._error = "Could not validate timestamp: not yet valid. Check system clock."
+                raise OneLogin_Saml2_ValidationError(self._error, OneLogin_Saml2_ValidationError.ASSERTION_TOO_EARLY)
+            if nooa_attr and OneLogin_Saml2_Utils.parse_SAML_to_time(nooa_attr) + OneLogin_Saml2_Constants.ALLOWED_CLOCK_DRIFT <= now:
+                self._error = "Could not validate timestamp: expired. Check system clock."
+                raise OneLogin_Saml2_ValidationError(self._error, OneLogin_Saml2_ValidationError.ASSERTION_EXPIRED)
+
+        # Checks the session Expiration
+        session_expiration = self.get_session_not_on_or_after()
+        if session_expiration and session_expiration + OneLogin_Saml2_Constants.ALLOWED_CLOCK_DRIFT <= now:
+            self._error = "The attributes have expired, based on the SessionNotOnOrAfter of the AttributeStatement of this Response"
+            raise OneLogin_Saml2_ValidationError(self._error, OneLogin_Saml2_ValidationError.SESSION_EXPIRED)
         return True
 
     def _query_assertion(self, xpath_expr):
