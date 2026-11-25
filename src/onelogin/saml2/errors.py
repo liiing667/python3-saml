@@ -110,6 +110,7 @@ class OneLogin_Saml2_ValidationError(Exception):
     AUTHN_CONTEXT_MISMATCH = 45
     DEPRECATED_SIGNATURE_METHOD = 46
     DEPRECATED_DIGEST_METHOD = 47
+    ASSERTION_NOT_SIGNED = 48
 
     def __init__(self, message, code=0, errors=None):
         """

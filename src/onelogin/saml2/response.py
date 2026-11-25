@@ -254,6 +254,14 @@ class OneLogin_Saml2_Response(object):
                 ):
                     raise OneLogin_Saml2_ValidationError("Signature validation failed. SAML Response rejected", OneLogin_Saml2_ValidationError.INVALID_SIGNATURE)
 
+                # Close the loop between the assertion that carries the identity data and the
+                # node that was actually verified by a signature. When the assertion is signed
+                # (or only the message is signed, in which case its Reference covers the whole
+                # Response), the single assertion consumed by the get_* methods must be the one
+                # pointed at by the verified signature reference. Otherwise an unsigned or
+                # wrapped assertion could be treated as the authenticated identity.
+                self.validate_signed_assertion(raise_exceptions=True)
+
             return True
         except Exception as err:
             self._error = str(err)
@@ -648,6 +656,78 @@ class OneLogin_Saml2_Response(object):
             expected_signature_nodes = self._query(OneLogin_Saml2_Utils.ASSERTION_SIGNATURE_XPATH)
             if len(expected_signature_nodes) != 1:
                 raise OneLogin_Saml2_ValidationError("Unexpected number of Assertion signatures found. SAML Response rejected.", OneLogin_Saml2_ValidationError.WRONG_NUMBER_OF_SIGNATURES_IN_ASSERTION)
+
+        return True
+
+    @return_false_on_exception
+    def validate_signed_assertion(self):
+        """
+        Verifies that the assertion whose identity data is exposed by the get_* methods
+        is the same assertion that is protected by a verified signature.
+
+        A SAML Response may contain a signed element together with extra assertions or
+        signature references. Relying only on the fact that *some* signature verified
+        would let an unsigned (or wrapped) assertion be treated as the authenticated
+        identity. This method closes that gap by matching the unique assertion of the
+        document against the element referenced by the verified signature:
+
+         - If the Assertion is signed, its ID must match the Reference URI of the
+           Assertion signature (an empty Reference URI references the whole document,
+           so the signed parent is used instead).
+         - Otherwise, when the Response message is signed, the message Reference URI
+           must point at the Response ID (an empty Reference URI is also accepted).
+
+        Encrypted assertions are checked against the decrypted document, so the method
+        works transparently for encrypted and double signed responses.
+
+        :param raise_exceptions: Whether to return false on failure or raise an exception
+        :type raise_exceptions: Boolean
+
+        :returns: True if the identity assertion is bound to a verified signature node
+        :rtype: bool
+        """
+        document = self.decrypted_document if self.encrypted else self.document
+
+        assertion_nodes = OneLogin_Saml2_XML.query(document, "/samlp:Response/saml:Assertion")
+        if len(assertion_nodes) != 1:
+            raise OneLogin_Saml2_ValidationError("SAML Response must contain 1 assertion", OneLogin_Saml2_ValidationError.WRONG_NUMBER_OF_ASSERTIONS)
+        assertion_node = assertion_nodes[0]
+
+        signature_nodes = OneLogin_Saml2_XML.query(document, OneLogin_Saml2_Utils.ASSERTION_SIGNATURE_XPATH)
+        if len(signature_nodes) > 1:
+            raise OneLogin_Saml2_ValidationError("Unexpected number of Assertion signatures found. SAML Response rejected.", OneLogin_Saml2_ValidationError.WRONG_NUMBER_OF_SIGNATURES_IN_ASSERTION)
+
+        if signature_nodes:
+            # The assertion carries its own signature: the identity assertion must be
+            # the signed parent or the element referenced by its Reference URI.
+            signature_node = signature_nodes[0]
+            reference_nodes = OneLogin_Saml2_XML.query(signature_node, ".//ds:Reference")
+            if reference_nodes and reference_nodes[0].get("URI"):
+                referenced_id = reference_nodes[0].get("URI")[1:]
+                if referenced_id == assertion_node.get("ID"):
+                    return True
+            elif signature_node.getparent() is assertion_node:
+                # An empty Reference URI references the whole document; the signed
+                # parent must then be the identity assertion itself.
+                return True
+
+            raise OneLogin_Saml2_ValidationError(
+                "Found an invalid Signed Element. The assertion of the Response is not covered by its signature. SAML Response rejected",
+                OneLogin_Saml2_ValidationError.ASSERTION_NOT_SIGNED,
+            )
+
+        # No assertion-level signature. The Response must be signed instead and its
+        # reference must cover the whole message (Response ID or an empty URI).
+        response_signature_nodes = OneLogin_Saml2_XML.query(document, OneLogin_Saml2_Utils.RESPONSE_SIGNATURE_XPATH)
+        if len(response_signature_nodes) != 1:
+            raise OneLogin_Saml2_ValidationError("No Signature found. SAML Response rejected", OneLogin_Saml2_ValidationError.NO_SIGNATURE_FOUND)
+
+        response_node = OneLogin_Saml2_XML.query(document, "/samlp:Response")[0]
+        reference_nodes = OneLogin_Saml2_XML.query(response_signature_nodes[0], ".//ds:Reference")
+        if reference_nodes and reference_nodes[0].get("URI") and reference_nodes[0].get("URI")[1:] != response_node.get("ID"):
+            raise OneLogin_Saml2_ValidationError(
+                "Found an invalid Signed Element. SAML Response rejected", OneLogin_Saml2_ValidationError.INVALID_SIGNED_ELEMENT
+            )
 
         return True
 

@@ -1,4 +1,7 @@
 # python3-saml changelog
+### Unreleased
+- Security: bind the assertion that provides the authenticated identity to the signature node that is actually verified. `is_valid` now runs a closure check (`validate_signed_assertion`) that rejects responses in which the identity assertion is not covered by a valid Assertion signature or by the Response message signature, so an unsigned or signature-wrapped assertion can no longer be treated as the signed identity. On validation failure the public `OneLogin_Saml2_Auth` flow keeps publishing no attributes/NameID. Legitimate double signed and encrypted assertions continue to validate, including signatures with an empty Reference URI.
+
 ### 1.16.0 (Oct 9, 2023)
 - [#364](https://github.com/SAML-Toolkits/python3-saml/commit/d1bfaeb17a786735827b8252b91deafde29dabd8) Improve get_metadata method from Parser, allowing to set headers
 - Fix WantAuthnRequestsSigned parser

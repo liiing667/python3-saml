@@ -10,11 +10,14 @@ from os.path import dirname, join, exists
 import unittest
 from xml.dom.minidom import parseString
 
+from onelogin.saml2.auth import OneLogin_Saml2_Auth
 from onelogin.saml2 import compat
+from onelogin.saml2.constants import OneLogin_Saml2_Constants
 from onelogin.saml2.errors import OneLogin_Saml2_ValidationError
 from onelogin.saml2.response import OneLogin_Saml2_Response
 from onelogin.saml2.settings import OneLogin_Saml2_Settings
 from onelogin.saml2.utils import OneLogin_Saml2_Utils
+from onelogin.saml2.xml_utils import OneLogin_Saml2_XML
 
 
 class OneLogin_Saml2_Response_Test(unittest.TestCase):
@@ -777,6 +780,208 @@ class OneLogin_Saml2_Response_Test(unittest.TestCase):
         response = OneLogin_Saml2_Response(settings, xml)
         self.assertEqual("test@onelogin.com", response.get_nameid())
         self.assertFalse(response.is_valid(self.get_request_data()))
+
+    def testValidateSignedAssertionBindsIdentityToSignature(self):
+        """
+        Tests validate_signed_assertion closes the loop between the assertion that
+        carries the identity data and the node that was actually verified by a
+        signature. Legitimate signed, double signed and encrypted responses keep
+        validating.
+        """
+        request_data = self.get_request_data()
+
+        # Assertion signed
+        settings = OneLogin_Saml2_Settings(self.loadSettingsJSON())
+        xml = self.file_contents(join(self.data_path, "responses", "signed_assertion_response.xml.base64"))
+        response = OneLogin_Saml2_Response(settings, xml)
+        self.assertTrue(response.validate_signed_assertion())
+        self.assertTrue(response.is_valid(request_data))
+
+        # Response and assertion signed (double signed)
+        xml = self.file_contents(join(self.data_path, "responses", "double_signed_response.xml.base64"))
+        response = OneLogin_Saml2_Response(settings, xml)
+        self.assertTrue(response.validate_signed_assertion())
+        self.assertTrue(response.is_valid(request_data))
+
+        # Only the message is signed: its reference covers the whole Response
+        xml = self.file_contents(join(self.data_path, "responses", "signed_message_response.xml.base64"))
+        response = OneLogin_Saml2_Response(settings, xml)
+        self.assertTrue(response.validate_signed_assertion())
+        self.assertTrue(response.is_valid(request_data))
+
+        # Encrypted assertion, assertion signature (on the decrypted document)
+        xml = self.file_contents(join(self.data_path, "responses", "signed_encrypted_assertion.xml.base64"))
+        response = OneLogin_Saml2_Response(settings, xml)
+        self.assertTrue(response.validate_signed_assertion())
+        self.assertTrue(response.is_valid(request_data))
+
+        # Encrypted assertion with double signature
+        xml = self.file_contents(join(self.data_path, "responses", "double_signed_encrypted_assertion.xml.base64"))
+        response = OneLogin_Saml2_Response(settings, xml)
+        self.assertTrue(response.validate_signed_assertion())
+        self.assertTrue(response.is_valid(request_data))
+
+        # Encrypted assertion with only the message signed
+        xml = self.file_contents(join(self.data_path, "responses", "signed_message_encrypted_assertion.xml.base64"))
+        response = OneLogin_Saml2_Response(settings, xml)
+        self.assertTrue(response.validate_signed_assertion())
+        self.assertTrue(response.is_valid(request_data))
+
+        # An empty Reference URI references the whole document and stays supported
+        settings_info = self.loadSettingsJSON("settings10.json")
+        del settings_info["idp"]["x509cert"]
+        settings_info["idp"]["certFingerprint"] = "657302a5e11a4794a1e50a705988d66c9377575d"
+        fingerprint_settings = OneLogin_Saml2_Settings(settings_info)
+
+        xml = self.file_contents(join(self.data_path, "responses", "response_without_assertion_reference_uri.xml.base64"))
+        response = OneLogin_Saml2_Response(fingerprint_settings, xml)
+        self.assertTrue(response.validate_signed_assertion())
+        self.assertTrue(response.is_valid(request_data))
+
+        xml = self.file_contents(join(self.data_path, "responses", "response_without_reference_uri.xml.base64"))
+        response = OneLogin_Saml2_Response(fingerprint_settings, xml)
+        self.assertTrue(response.validate_signed_assertion())
+        self.assertTrue(response.is_valid(request_data))
+
+    def testValidateSignedAssertionRejectsRetargetedAssertionReference(self):
+        """
+        A signature reference that does not point at the identity assertion must
+        reject the response, so an unsigned assertion can never be treated as the
+        signed identity. process_signed_elements already rejects references that do
+        not match the signed parent; the closure check provides the same guarantee
+        on the document it consumes.
+        """
+        settings = OneLogin_Saml2_Settings(self.loadSettingsJSON())
+        xml = self.file_contents(join(self.data_path, "responses", "signed_assertion_response.xml.base64"))
+        plain_message = OneLogin_Saml2_Utils.b64decode(xml)
+        dom = parseString(plain_message)
+        reference_nodes = dom.getElementsByTagName("ds:Reference")
+        self.assertEqual(1, len(reference_nodes))
+        reference_nodes[0].setAttribute("URI", "#_an_assertion_that_is_not_the_identity_one")
+        tampered_message = OneLogin_Saml2_Utils.b64encode(dom.toxml())
+
+        response = OneLogin_Saml2_Response(settings, tampered_message)
+        self.assertFalse(response.validate_signed_assertion())
+        with self.assertRaisesRegex(OneLogin_Saml2_ValidationError, "not covered by its signature"):
+            response.validate_signed_assertion(raise_exceptions=True)
+        # The full public validation rejects the tampered response as well and no
+        # identity attributes are published through the Auth flow.
+        request_data = dict(self.get_request_data())
+        request_data["post_data"] = {"SAMLResponse": tampered_message}
+        auth = OneLogin_Saml2_Auth(request_data, self.loadSettingsJSON())
+        auth.process_response()
+        self.assertEqual(["invalid_response"], auth.get_errors())
+        self.assertFalse(auth.is_authenticated())
+        self.assertEqual({}, auth.get_attributes())
+        self.assertIsNone(auth.get_nameid())
+
+    def testValidateSignedAssertionRejectsRetargetedMessageReference(self):
+        """
+        When only the message is signed, the message reference must cover the
+        Response itself; a reference pointing elsewhere must reject the response.
+        """
+        settings = OneLogin_Saml2_Settings(self.loadSettingsJSON())
+        xml = self.file_contents(join(self.data_path, "responses", "signed_message_response.xml.base64"))
+        plain_message = OneLogin_Saml2_Utils.b64decode(xml)
+        dom = parseString(plain_message)
+        reference_nodes = dom.getElementsByTagName("ds:Reference")
+        self.assertEqual(1, len(reference_nodes))
+        reference_nodes[0].setAttribute("URI", "#_not_the_response_id")
+        tampered_message = OneLogin_Saml2_Utils.b64encode(dom.toxml())
+
+        response = OneLogin_Saml2_Response(settings, tampered_message)
+        self.assertFalse(response.validate_signed_assertion())
+        self.assertFalse(response.is_valid(self.get_request_data()))
+
+    def testValidateSignedAssertionRejectsDetachedSignature(self):
+        """
+        A single top-level assertion whose signature has been detached into another
+        element must not validate: the identity assertion is not the signed node.
+        The public Auth flow must then keep the default (empty) identity, so the
+        forged attributes are never published.
+        """
+        settings_info = self.loadSettingsJSON()
+        settings_info["strict"] = False
+        settings = OneLogin_Saml2_Settings(settings_info)
+
+        xml = self.file_contents(join(self.data_path, "responses", "signed_assertion_response.xml.base64"))
+        document = OneLogin_Saml2_XML.to_etree(OneLogin_Saml2_Utils.b64decode(xml))
+
+        assertion_nodes = OneLogin_Saml2_XML.query(document, "/samlp:Response/saml:Assertion")
+        signature_nodes = OneLogin_Saml2_XML.query(document, "/samlp:Response/saml:Assertion/ds:Signature")
+        self.assertEqual(1, len(assertion_nodes))
+        self.assertEqual(1, len(signature_nodes))
+
+        assertion_node = assertion_nodes[0]
+        signature_node = signature_nodes[0]
+        response_node = OneLogin_Saml2_XML.query(document, "/samlp:Response")[0]
+
+        # Move the signature into a sibling holder so the assertion is no longer
+        # the signed parent, then tamper the now unsigned identity.
+        holder = response_node.makeelement("{urn:custom:evil}SignatureHolder", nsmap={"evil": "urn:custom:evil"})
+        assertion_node.remove(signature_node)
+        holder.append(signature_node)
+        assertion_node.addprevious(holder)
+
+        nameid_nodes = OneLogin_Saml2_XML.query(document, "/samlp:Response/saml:Assertion/saml:Subject/saml:NameID")
+        nameid_nodes[0].text = "attacker@evil.example"
+
+        tampered_message = OneLogin_Saml2_Utils.b64encode(OneLogin_Saml2_XML.to_string(document))
+        response = OneLogin_Saml2_Response(settings, tampered_message)
+        self.assertFalse(response.is_valid(self.get_request_data()))
+
+        # Through the public Auth flow, validation failure must not publish any
+        # attribute or NameID taken from the unsigned assertion.
+        request_data = dict(self.get_request_data())
+        request_data["post_data"] = {"SAMLResponse": tampered_message}
+        auth = OneLogin_Saml2_Auth(request_data, settings_info)
+        auth.process_response()
+        self.assertEqual(["invalid_response"], auth.get_errors())
+        self.assertFalse(auth.is_authenticated())
+        self.assertEqual({}, auth.get_attributes())
+        self.assertIsNone(auth.get_nameid())
+
+    def testUnsignedAssertionAlongsideSignedAssertionIsNotPublished(self):
+        """
+        Reproduces the report scenario: a Response containing a genuinely signed
+        assertion together with an extra unsigned assertion that carries an
+        attacker controlled identity. Validation must fail and the public Auth
+        flow must never publish the unsigned identity as attributes or NameID.
+        """
+        from copy import deepcopy
+
+        settings_info = self.loadSettingsJSON()
+        settings_info["strict"] = False
+
+        plain_message = OneLogin_Saml2_Utils.b64decode(
+            self.file_contents(join(self.data_path, "responses", "signed_assertion_response.xml.base64"))
+        )
+        document = OneLogin_Saml2_XML.to_etree(plain_message)
+
+        signed_assertion = OneLogin_Saml2_XML.query(document, "/samlp:Response/saml:Assertion[ds:Signature]")[0]
+
+        # Build an unsigned forged assertion from the signed one and tamper its NameID
+        forged_assertion = deepcopy(signed_assertion)
+        forged_assertion.remove(forged_assertion.find("{%s}Signature" % OneLogin_Saml2_Constants.NS_DS))
+        forged_assertion.set("ID", "_forged_unsigned_assertion")
+        forged_nameid = OneLogin_Saml2_XML.query(forged_assertion, "/saml:Assertion/saml:Subject/saml:NameID")[0]
+        forged_nameid.text = "attacker@evil.example"
+        signed_assertion.addprevious(forged_assertion)
+
+        tampered_message = OneLogin_Saml2_Utils.b64encode(OneLogin_Saml2_XML.to_string(document))
+
+        response = OneLogin_Saml2_Response(OneLogin_Saml2_Settings(settings_info), tampered_message)
+        self.assertFalse(response.is_valid(self.get_request_data()))
+        self.assertFalse(response.validate_signed_assertion())
+
+        request_data = dict(self.get_request_data())
+        request_data["post_data"] = {"SAMLResponse": tampered_message}
+        auth = OneLogin_Saml2_Auth(request_data, settings_info)
+        auth.process_response()
+        self.assertEqual(["invalid_response"], auth.get_errors())
+        self.assertFalse(auth.is_authenticated())
+        self.assertEqual({}, auth.get_attributes())
+        self.assertIsNone(auth.get_nameid())
 
     def testNodeTextAttack(self):
         """
