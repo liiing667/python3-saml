@@ -8,6 +8,8 @@ SAML Response class of SAML Python Toolkit.
 """
 
 from copy import deepcopy
+from urllib.parse import urlsplit
+
 from onelogin.saml2.constants import OneLogin_Saml2_Constants
 from onelogin.saml2.utils import OneLogin_Saml2_Utils, OneLogin_Saml2_Error, OneLogin_Saml2_ValidationError, return_false_on_exception
 from onelogin.saml2.xml_utils import OneLogin_Saml2_XML
@@ -254,6 +256,12 @@ class OneLogin_Saml2_Response(object):
                 ):
                     raise OneLogin_Saml2_ValidationError("Signature validation failed. SAML Response rejected", OneLogin_Saml2_ValidationError.INVALID_SIGNATURE)
 
+            # Even when strict mode is disabled, an accepted (signed) Response
+            # must describe a single receiving SP.  The audience, the
+            # SubjectConfirmation Recipient/Destination and the NameID
+            # qualifier may not be mixed from different SPs/deployments.
+            self._validate_receiver_binding(sp_entity_id)
+
             return True
         except Exception as err:
             self._error = str(err)
@@ -263,6 +271,178 @@ class OneLogin_Saml2_Response(object):
             if raise_exceptions:
                 raise
             return False
+
+    @staticmethod
+    def _url_origin(url):
+        """
+        Returns the normalized (scheme, netloc) pair of a URL, or None when
+        the value does not contain a usable URL origin.
+        """
+        if not url:
+            return None
+        try:
+            parts = urlsplit(OneLogin_Saml2_Utils.normalize_url(url))
+        except Exception:
+            return None
+        if not parts.scheme or not parts.netloc:
+            return None
+        return parts.scheme.lower(), parts.netloc.lower()
+
+    @classmethod
+    def _same_origin(cls, first, second):
+        """
+        Whether two values point to the same scheme/host/port origin.  Used to
+        tie an entityID to the ACS URL of the very same SP without requiring
+        the two paths to be identical.
+        """
+        first_origin = cls._url_origin(first)
+        second_origin = cls._url_origin(second)
+        return first_origin is not None and first_origin == second_origin
+
+    @staticmethod
+    def _same_url(first, second):
+        """
+        Compares two URLs after normalizing casing of scheme/host and ignoring
+        a trailing slash.
+        """
+        if not first or not second:
+            return False
+        return OneLogin_Saml2_Utils.normalize_url(first).rstrip("/") == OneLogin_Saml2_Utils.normalize_url(second).rstrip("/")
+
+    def _get_bearer_recipients(self):
+        """
+        Returns the Recipient values of all bearer SubjectConfirmationData
+        elements that could be used to deliver this Response.
+        """
+        recipients = []
+        subject_confirmation_nodes = self._query_assertion("/saml:Subject/saml:SubjectConfirmation")
+        if not subject_confirmation_nodes:
+            # A message-signed Response may use an empty Reference URI.  In
+            # that case _query_assertion cannot use the reference to scope the
+            # query; the assertion is already covered by the message signature
+            # and validate_num_assertions guarantees that only one exists.
+            subject_confirmation_nodes = self._query("/samlp:Response/saml:Assertion/saml:Subject/saml:SubjectConfirmation")
+        for scn in subject_confirmation_nodes:
+            method = scn.get("Method", None)
+            if method and method != OneLogin_Saml2_Constants.CM_BEARER:
+                continue
+            sc_data = scn.find("saml:SubjectConfirmationData", namespaces=OneLogin_Saml2_Constants.NSMAP)
+            if sc_data is None:
+                continue
+            recipient = sc_data.get("Recipient", None)
+            if recipient:
+                recipients.append(recipient)
+        return recipients
+
+    def _validate_receiver_binding(self, sp_entity_id):
+        """
+        Binds the accepted subject to one receiver.
+
+        A Response is only usable by the SP it actually names: the
+        SubjectConfirmationData Recipient (and the Response Destination) must
+        identify the same SP as the Audience and the NameID SPNameQualifier.
+        Multiple audiences are allowed as long as at least one of them belongs
+        to the receiver; the IdP-side NameQualifier is not constrained.
+
+        :raises OneLogin_Saml2_ValidationError: when the identities do not
+            describe the same receiver.
+        """
+        audiences = self.get_audiences()
+        if not audiences:
+            # Same fallback as above for message-signed Responses with an
+            # empty Reference URI.
+            audiences = [
+                OneLogin_Saml2_XML.element_text(node)
+                for node in self._query("/samlp:Response/saml:Assertion/saml:Conditions/saml:AudienceRestriction/saml:Audience")
+                if OneLogin_Saml2_XML.element_text(node) is not None
+            ]
+        sp_data = self._settings.get_sp_data()
+        sp_acs_url = sp_data.get("assertionConsumerService", {}).get("url", None)
+        destination = self.document.get("Destination", None)
+
+        recipients = self._get_bearer_recipients()
+        if not recipients:
+            raise OneLogin_Saml2_ValidationError(
+                "A valid SubjectConfirmation was not found on this Response", OneLogin_Saml2_ValidationError.WRONG_SUBJECTCONFIRMATION
+            )
+
+        if not audiences:
+            # Legacy Responses without Conditions/AudienceRestriction have no
+            # audience identity to compare against.  Keep accepting them when
+            # the Recipient/Destination describe the same receiving endpoint
+            # and the NameID is qualified for that endpoint (or not qualified
+            # at all).  Strict mode keeps rejecting them for missing
+            # Conditions before this point.
+            bound_recipient = recipients[0]
+            if destination and not self._same_url(destination, bound_recipient):
+                raise OneLogin_Saml2_ValidationError(
+                    "The Destination of the Response does not belong to the Recipient", OneLogin_Saml2_ValidationError.WRONG_DESTINATION
+                )
+            nameid_data = self.get_nameid_data()
+            sp_name_qualifier = nameid_data.get("SPNameQualifier", None) if nameid_data else None
+            if sp_name_qualifier and not (
+                self._same_url(sp_name_qualifier, sp_entity_id) or self._same_origin(sp_name_qualifier, bound_recipient)
+            ):
+                raise OneLogin_Saml2_ValidationError(
+                    "The SPNameQualifier value mistmatch the SP entityID value.", OneLogin_Saml2_ValidationError.SP_NAME_QUALIFIER_NAME_MISMATCH
+                )
+            return
+
+        # If the Response names this SP (the configured entityID) it must be
+        # delivered to this SP's configured ACS, not merely to another endpoint
+        # on the same host.  Only Responses that consistently name another
+        # (legacy/proxy) deployment may be bound by their own audience origin.
+        audience_is_target = any(audience == sp_entity_id or self._same_url(audience, sp_entity_id) for audience in audiences)
+
+        def recipient_is_bound(recipient):
+            if audience_is_target:
+                if not sp_acs_url:
+                    return self._same_origin(sp_entity_id, recipient)
+                if self._same_url(recipient, sp_acs_url):
+                    return True
+                # If the configured entityID and ACS already live on different
+                # origins, the deployment itself uses a proxy/alias mapping;
+                # fall back to the audience/Recipient origin.  When both
+                # settings share an origin, a different ACS path is rejected.
+                if sp_acs_url and not self._same_origin(sp_entity_id, sp_acs_url) and self._same_origin(sp_entity_id, recipient):
+                    return True
+                return False
+            for audience in audiences:
+                if self._same_origin(audience, recipient):
+                    return True
+            return False
+
+        bound_recipient = None
+        for recipient in recipients:
+            if recipient_is_bound(recipient):
+                bound_recipient = recipient
+                break
+
+        if bound_recipient is None:
+            raise OneLogin_Saml2_ValidationError(
+                "The Recipient of the SubjectConfirmation does not belong to this SP", OneLogin_Saml2_ValidationError.WRONG_SUBJECTCONFIRMATION
+            )
+
+        if destination:
+            if not (self._same_url(destination, bound_recipient) or self._same_url(destination, sp_acs_url)):
+                raise OneLogin_Saml2_ValidationError(
+                    "The Destination of the Response does not belong to the Recipient", OneLogin_Saml2_ValidationError.WRONG_DESTINATION
+                )
+
+        # The NameID may only be qualified for the receiver identified above.
+        # A missing SPNameQualifier is valid (legacy IdPs), and NameQualifier
+        # is the IdP's own identifier, so it is deliberately not constrained.
+        nameid_data = self.get_nameid_data()
+        sp_name_qualifier = nameid_data.get("SPNameQualifier", None) if nameid_data else None
+        if sp_name_qualifier:
+            if audience_is_target:
+                qualified_for_receiver = self._same_url(sp_name_qualifier, sp_entity_id)
+            else:
+                qualified_for_receiver = self._same_url(sp_name_qualifier, sp_entity_id) or self._same_origin(sp_name_qualifier, bound_recipient)
+            if not qualified_for_receiver:
+                raise OneLogin_Saml2_ValidationError(
+                    "The SPNameQualifier value mistmatch the SP entityID value.", OneLogin_Saml2_ValidationError.SP_NAME_QUALIFIER_NAME_MISMATCH
+                )
 
     def check_status(self):
         """

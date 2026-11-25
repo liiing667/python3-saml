@@ -95,21 +95,45 @@ class OneLogin_Saml2_Auth(object):
         self._settings.set_strict(value)
 
     def store_valid_response(self, response):
-        self._attributes = response.get_attributes()
-        self._friendlyname_attributes = response.get_friendlyname_attributes()
-        self._nameid = response.get_nameid()
-        self._nameid_format = response.get_nameid_format()
-        self._nameid_nq = response.get_nameid_nq()
-        self._nameid_spnq = response.get_nameid_spnq()
-        self._session_index = response.get_session_index()
-        self._session_expiration = response.get_session_not_on_or_after()
-        self._last_message_id = response.get_id()
-        self._last_assertion_id = response.get_assertion_id()
-        self._last_assertion_issue_instant = response.get_assertion_issue_instant()
-        self._last_authn_contexts = response.get_authn_contexts()
+        """
+        Publishes the data of a validated Response.
+
+        The whole snapshot is built before any attribute of this object is
+        changed, so a failure while reading the Response cannot leave a
+        partially overwritten session behind.  In that case the previously
+        authenticated subject (if any) remains the one observed by consumers.
+        """
+        attributes = response.get_attributes()
+        friendlyname_attributes = response.get_friendlyname_attributes()
+        nameid = response.get_nameid()
+        nameid_format = response.get_nameid_format()
+        nameid_nq = response.get_nameid_nq()
+        nameid_spnq = response.get_nameid_spnq()
+        session_index = response.get_session_index()
+        session_expiration = response.get_session_not_on_or_after()
+        last_message_id = response.get_id()
+        last_assertion_id = response.get_assertion_id()
+        last_assertion_issue_instant = response.get_assertion_issue_instant()
+        last_authn_contexts = response.get_authn_contexts()
+        last_response_in_response_to = response.get_in_response_to()
+        last_assertion_not_on_or_after = response.get_assertion_not_on_or_after()
+
+        # Commit point: only a fully read Response replaces the current state.
+        self._attributes = attributes
+        self._friendlyname_attributes = friendlyname_attributes
+        self._nameid = nameid
+        self._nameid_format = nameid_format
+        self._nameid_nq = nameid_nq
+        self._nameid_spnq = nameid_spnq
+        self._session_index = session_index
+        self._session_expiration = session_expiration
+        self._last_message_id = last_message_id
+        self._last_assertion_id = last_assertion_id
+        self._last_assertion_issue_instant = last_assertion_issue_instant
+        self._last_authn_contexts = last_authn_contexts
+        self._last_response_in_response_to = last_response_in_response_to
+        self._last_assertion_not_on_or_after = last_assertion_not_on_or_after
         self._authenticated = True
-        self._last_response_in_response_to = response.get_in_response_to()
-        self._last_assertion_not_on_or_after = response.get_assertion_not_on_or_after()
 
     def process_response(self, request_id=None):
         """
